@@ -1,0 +1,9 @@
+SecRecorder (aka SpeakerBox)
+Copyright 2026 Austin Probe
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product downloads and runs third-party model weights at runtime (OpenAI Whisper via MLX /
+CTranslate2, and pyannote speaker-diarization models). Those weights are not distributed with this
+project and are subject to their own licenses; the pyannote models are gated and require accepting
+their terms.

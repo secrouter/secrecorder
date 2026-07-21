@@ -1,0 +1,17 @@
+# secrets — NEVER commit (HF token lives here)
+.env
+secrets.env
+
+# environment / caches
+.venv/
+__pycache__/
+*.pyc
+
+# runtime logs
+*.log
+
+# test audio + benchmark data (large / machine-specific) — but keep the .md result docs
+*.wav
+*.aiff
+bench/assets/
+bench/**/*.json

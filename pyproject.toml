@@ -1,0 +1,18 @@
+[project]
+name = "speakerbox"
+version = "0.6.1"
+description = "Multi-backend Whisper server (Apple MLX / faster-whisper CUDA) with an OpenAI-compatible API + diarization"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "python-multipart",
+    "python-dotenv",
+    "pyannote.audio>=4",
+    # ASR backend is platform-specific; server.py auto-selects at runtime:
+    #   Apple Silicon → MLX/Metal ; Linux → faster-whisper/CTranslate2 (CUDA or CPU).
+    "mlx-whisper; platform_system == 'Darwin'",
+    "faster-whisper; platform_system == 'Linux'",
+]

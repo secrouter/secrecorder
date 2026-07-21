@@ -1,0 +1,506 @@
+# Copyright 2026 Austin Probe
+# SPDX-License-Identifier: Apache-2.0
+"""Whisper ASR server with an OpenAI-compatible API — multi-backend.
+
+Serves ``POST /v1/audio/transcriptions`` (multipart, ``response_format=verbose_json``,
+``timestamp_granularities[]=word``) and returns a top-level ``words[]`` array with real word-level
+timestamps — the OpenAI verbose_json shape, so existing OpenAI clients work by pointing ``base_url``
+here. Also serves the OpenAI Models API (``/v1/models``) and a ``/health`` liveness check.
+
+**Pluggable ASR backend** (``WHISPER_BACKEND=auto|mlx|faster-whisper``; auto picks whichever is
+installed):
+  * ``mlx``            — Apple MLX (Metal) on Apple Silicon.
+  * ``faster-whisper`` — CTranslate2 on NVIDIA CUDA (or CPU). ``WHISPER_DEVICE=auto|cuda|cpu``,
+                         ``WHISPER_COMPUTE_TYPE`` (default float16 on cuda, int8 on cpu).
+Both normalise to the same segments/words shape, so the endpoints, reliability, and diarization
+below are backend-agnostic.
+
+Optional **speaker diarization** (pyannote ``community-1``, PyTorch — CUDA/MPS/CPU): pass
+``diarize=true`` (or set ``WHISPER_DIARIZE=1`` to default it on) and every word/segment gains a
+``"speaker"`` (``SPEAKER_00``…) plus a top-level ``speakers`` talk-time summary. Extra fields are
+ignored by clients that don't know them, so the contract stays backward compatible. Diarization
+failures degrade gracefully: the transcription is returned with a ``diarization_error`` instead of
+a 500. Requires ``HF_TOKEN`` (gated model) — read from the environment or ``.env`` next to this file.
+
+Reliability on large recordings:
+  * the blocking transcription runs in a worker thread (``asyncio.to_thread``), so the event loop
+    — and ``/health`` — stays responsive for the whole multi-minute job instead of hanging;
+  * GPU work is serialized by a semaphore (``WHISPER_MAX_CONCURRENCY``, default 1) so concurrent
+    large recordings queue instead of contending for / exhausting GPU memory;
+  * the upload is streamed to disk in chunks (bounded memory), with an optional size cap;
+  * the backend's GPU cache is released after each job to curb cross-job memory growth.
+
+    WHISPER_BACKEND=faster-whisper WHISPER_MODEL=large-v3 WHISPER_DEVICE=cuda \\
+        uv run uvicorn server:app --host 0.0.0.0 --port 9000
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import importlib.util
+import math
+import os
+import tempfile
+import threading
+import time
+
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+# pyannote runs on torch; a few ops still lack MPS kernels on Apple — fall back per-op.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
+
+BACKEND = os.environ.get("WHISPER_BACKEND", "auto").strip().lower()
+MODEL = os.environ.get("WHISPER_MODEL", "").strip()  # empty → per-backend default below
+# faster-whisper device / precision (ignored by mlx).
+DEVICE = os.environ.get("WHISPER_DEVICE", "auto").strip().lower()
+COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "").strip()
+# Serialize GPU work: one transcription at a time by default, so concurrent large recordings queue
+# instead of contending for (and exhausting) GPU memory. Raise only if the GPU can hold N at once.
+MAX_CONCURRENCY = max(1, int(os.environ.get("WHISPER_MAX_CONCURRENCY", "1")))
+# Optional upload cap in MiB; 0 = unlimited. Guards the disk against a runaway upload.
+MAX_UPLOAD_MB = int(os.environ.get("WHISPER_MAX_UPLOAD_MB", "0"))
+# Diarization runs on a SEPARATE semaphore (torch/MPS) from ASR (MLX), so episode N's diarization
+# doesn't block episode N+1's transcription — the two frameworks pipeline on the GPU.
+DIA_CONCURRENCY = max(1, int(os.environ.get("WHISPER_DIA_CONCURRENCY", "1")))
+# Prewarm: load the model (and optionally the diarizer) at startup rather than on the first
+# request, so a restart has no cold-start hit. PREWARM_DIARIZER covers per-request diarize workloads
+# (where WHISPER_DIARIZE default-off but the client still sends diarize=true).
+PREWARM = os.environ.get("WHISPER_PREWARM", "0").strip().lower() in ("1", "true", "yes", "on")
+PREWARM_DIARIZER = os.environ.get("WHISPER_PREWARM_DIARIZER", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# Speaker diarization (opt-in per request via diarize=true; WHISPER_DIARIZE=1 defaults it on).
+DIARIZE_MODEL = os.environ.get("WHISPER_DIARIZE_MODEL", "pyannote/speaker-diarization-community-1")
+DIARIZE_DEFAULT = os.environ.get("WHISPER_DIARIZE", "0").lower() in ("1", "true", "yes", "on")
+HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+# Hard on/off for diarization. On hardware where pyannote/torch can't load — an old GPU (torch has
+# no kernels for it) or a missing system FFmpeg (torchcodec) — the model load can ABORT natively,
+# which a Python try/except can't catch. Set WHISPER_ALLOW_DIARIZE=0 there so a diarize=true request
+# is ignored (returns a normal transcript) instead of crashing the process.
+DIARIZE_ENABLED = os.environ.get("WHISPER_ALLOW_DIARIZE", "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _resolve_backend_name() -> str:
+    """Which backend to use — resolved cheaply (no model load) so /health and /v1/models work
+    before the first transcription. ``auto`` prefers mlx when importable, else faster-whisper."""
+    if BACKEND in ("mlx", "faster-whisper", "faster_whisper", "ctranslate2"):
+        return "mlx" if BACKEND == "mlx" else "faster-whisper"
+    return "mlx" if importlib.util.find_spec("mlx_whisper") else "faster-whisper"
+
+
+BACKEND_NAME = _resolve_backend_name()
+_DEFAULT_MODEL = {"mlx": "mlx-community/whisper-large-v3-turbo"}.get(BACKEND_NAME, "large-v3")
+MODEL_ID = MODEL or _DEFAULT_MODEL  # display id; the heavy model load stays lazy in the backend
+
+
+# --- ASR backend abstraction --------------------------------------------------------------------
+# A backend loads a model once and turns an audio path into a normalised result:
+#   {"language": str, "text": str,
+#    "segments": [{"start": s, "end": s, "text": str, "words": [{"word","start","end"}]}]}
+
+
+class MlxBackend:
+    name = "mlx"
+
+    def __init__(self, model_id: str) -> None:
+        import mlx.core as mx  # noqa: F401 — validate the import + hold for clear_cache
+        self.model_id = model_id
+        self.device = "mps"
+        self._mx = mx
+
+    def transcribe(self, path: str) -> dict:
+        import mlx_whisper
+        return mlx_whisper.transcribe(path, path_or_hf_repo=self.model_id, word_timestamps=True)
+
+    def clear_cache(self) -> None:
+        for fn in (getattr(self._mx, "clear_cache", None),
+                   getattr(getattr(self._mx, "metal", None), "clear_cache", None)):
+            if callable(fn):
+                fn()
+                return
+
+
+class FasterWhisperBackend:
+    name = "faster-whisper"
+
+    def __init__(self, model_id: str, device: str, compute_type: str) -> None:
+        from faster_whisper import WhisperModel
+        if device == "auto":
+            device = "cuda" if _cuda_available() else "cpu"
+        compute_type = compute_type or ("float16" if device == "cuda" else "int8")
+        self.model_id = model_id
+        self.device = device
+        self.compute_type = compute_type
+        self._model = WhisperModel(model_id, device=device, compute_type=compute_type)
+
+    def transcribe(self, path: str) -> dict:
+        segments, info = self._model.transcribe(path, word_timestamps=True)
+        out = []
+        for s in segments:  # generator — consuming it runs the transcription
+            out.append({
+                "start": float(s.start or 0.0), "end": float(s.end or 0.0), "text": s.text or "",
+                "words": [{"word": w.word, "start": float(w.start or 0.0), "end": float(w.end or 0.0)}
+                          for w in (s.words or [])],
+            })
+        return {"language": info.language, "text": " ".join(x["text"] for x in out), "segments": out}
+
+    def clear_cache(self) -> None:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001 — best-effort
+            pass
+
+
+def _cuda_available() -> bool:
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:  # noqa: BLE001 — torch may be absent; ask ctranslate2 directly
+        try:
+            import ctranslate2
+            return ctranslate2.get_cuda_device_count() > 0
+        except Exception:  # noqa: BLE001
+            return False
+
+
+# Separate semaphores so ASR (MLX) and diarization (torch/MPS) PIPELINE instead of serializing:
+# a transcription can run while a previous episode's diarization is still going. Both bind to the
+# running loop on first await (py3.11+).
+_asr_sem = asyncio.Semaphore(MAX_CONCURRENCY)   # MLX transcription
+_dia_sem = asyncio.Semaphore(DIA_CONCURRENCY)   # pyannote diarization
+_inflight = 0  # jobs queued or running (single-threaded loop → += is safe)
+
+_backend = None
+_backend_lock = threading.Lock()
+
+
+def _prewarm() -> None:
+    """Load the model — and the diarizer if PREWARM_DIARIZER — once, off the request path. Runs in
+    a background thread so the server accepts connections immediately; the load-locks in
+    ``_get_backend``/``_load_diarizer`` make a racing first request wait rather than double-load."""
+    try:
+        _get_backend()
+    except Exception as e:  # noqa: BLE001 — a prewarm failure must not stop the server booting
+        print(f"[whisper] backend prewarm failed (will retry lazily): {e}")
+    if PREWARM_DIARIZER and DIARIZE_ENABLED:
+        try:
+            _load_diarizer()
+        except Exception as e:  # noqa: BLE001
+            print(f"[whisper] diarizer prewarm failed (will retry lazily): {e}")
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app):
+    if PREWARM or PREWARM_DIARIZER:
+        threading.Thread(target=_prewarm, name="prewarm", daemon=True).start()
+    yield
+
+
+app = FastAPI(title="SecRecorder", version="0.6.1", lifespan=_lifespan)
+
+_diarizer = None  # lazy-loaded pyannote pipeline (first diarize request pays the load)
+_diarizer_device = ""
+_diarizer_lock = threading.Lock()
+
+
+def _get_backend():
+    """Load the ASR backend + model once (thread-safe; first transcription pays the load)."""
+    global _backend
+    with _backend_lock:
+        if _backend is not None:
+            return _backend
+        if BACKEND_NAME == "mlx":
+            _backend = MlxBackend(MODEL_ID)
+        else:
+            _backend = FasterWhisperBackend(MODEL_ID, DEVICE, COMPUTE_TYPE)
+        print(f"[whisper] backend={_backend.name} model={_backend.model_id} device={_backend.device}")
+        return _backend
+
+
+def _load_diarizer():
+    """Load the pyannote pipeline once (thread-safe), preferring CUDA, then MPS, then CPU."""
+    global _diarizer, _diarizer_device
+    with _diarizer_lock:
+        if _diarizer is not None:
+            return _diarizer
+        import torch
+        from pyannote.audio import Pipeline
+
+        pipe = Pipeline.from_pretrained(DIARIZE_MODEL, token=HF_TOKEN)
+        if pipe is None:  # gated model not accepted / bad token
+            raise RuntimeError(
+                f"could not load {DIARIZE_MODEL} — accept its conditions on HuggingFace "
+                "and set HF_TOKEN")
+        _diarizer_device = "cpu"
+        for dev in ("cuda", "mps"):
+            avail = (dev == "cuda" and torch.cuda.is_available()) or \
+                    (dev == "mps" and torch.backends.mps.is_available())
+            if avail:
+                try:
+                    pipe.to(torch.device(dev))
+                    _diarizer_device = dev
+                    break
+                except Exception:  # noqa: BLE001 — device move failed; try the next / CPU
+                    pass
+        _diarizer = pipe
+        print(f"[whisper] diarizer loaded: {DIARIZE_MODEL} on {_diarizer_device}")
+        return _diarizer
+
+
+def _json_safe(obj, path: str = "", found: list | None = None):
+    """Replace non-finite floats (NaN / ±inf) with None, recursively.
+
+    Starlette's JSONResponse serializes with ``allow_nan=False``, so ONE NaN anywhere in the
+    payload raises and turns the whole request into a 500 — losing an entire episode's transcript.
+    mlx-whisper emits NaN in segment scores (``avg_logprob`` / ``compression_ratio`` /
+    ``no_speech_prob``) on degenerate audio (silence, music beds), and we pass ``segments`` through
+    verbatim. Null is the honest JSON for "no value" and every consumer already tolerates a missing
+    score; the words/timings the client actually needs are unaffected."""
+    if isinstance(obj, float):
+        if math.isfinite(obj):
+            return obj
+        if found is not None:
+            found.append(path or "<root>")
+        return None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v, f"{path}.{k}" if path else str(k), found) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v, f"{path}[]", found) for v in obj]
+    return obj
+
+
+def _speaker_embeddings(out) -> dict[str, list[float]]:
+    """Per-speaker voiceprints from a pyannote 4.x ``DiarizeOutput`` → ``{label: vector}``.
+
+    These let a CHUNKING client link speakers across independently-diarized chunks (chunk 2's
+    SPEAKER_00 is not chunk 1's) by cosine similarity — measured ~0.92-0.98 for the same voice vs
+    <=0.30 for different ones. Rows are ordered by ``speaker_diarization.labels()``. A speaker with
+    too little speech can yield a non-finite vector; those are omitted so the client treats them as
+    unmatched (a new speaker) rather than matching on garbage."""
+    raw = getattr(out, "speaker_embeddings", None)
+    base = getattr(out, "speaker_diarization", None)
+    if raw is None or base is None:
+        return {}
+    emb: dict[str, list[float]] = {}
+    for i, lbl in enumerate(base.labels()):
+        if i >= len(raw):
+            break
+        vec = [float(x) for x in raw[i]]
+        if vec and all(math.isfinite(x) for x in vec):
+            emb[str(lbl)] = [round(x, 6) for x in vec]
+    return emb
+
+
+def _diarize(path: str) -> tuple[list[tuple[float, float, str]], dict[str, list[float]]]:
+    """Run diarization → (sorted ``[(start_s, end_s, label)]`` turns, ``{label: embedding}``).
+    pyannote 4.x returns a ``DiarizeOutput`` — use its ``exclusive_speaker_diarization``
+    (non-overlapping turns, made for transcription alignment); older pipelines return the
+    ``Annotation`` directly (and carry no embeddings)."""
+    out = _load_diarizer()(path)
+    annotation = (getattr(out, "exclusive_speaker_diarization", None)
+                  or getattr(out, "speaker_diarization", None) or out)
+    turns = [(float(seg.start), float(seg.end), str(label))
+             for seg, _track, label in annotation.itertracks(yield_label=True)]
+    turns.sort()
+    return turns, _speaker_embeddings(out)
+
+
+def _assign_speakers(words: list[dict], turns: list[tuple[float, float, str]]) -> None:
+    """Stamp each word dict with the speaker whose turn contains its midpoint (nearest turn when
+    the word falls in a gap). In place; no-op without turns."""
+    if not turns:
+        return
+    for w in words:
+        mid = (w["start"] + w["end"]) / 2
+        best, best_d = None, None
+        for ts, te, label in turns:
+            if ts <= mid < te:
+                best = label
+                break
+            d = (ts - mid) if mid < ts else (mid - te)
+            if best_d is None or d < best_d:
+                best, best_d = label, d
+        w["speaker"] = best
+
+
+def _transcribe_only(path: str) -> dict:
+    """Blocking transcription — ALWAYS called via ``asyncio.to_thread`` so it never blocks the event
+    loop. Releases the backend GPU cache afterwards so the next large job starts clean."""
+    backend = _get_backend()
+    try:
+        return backend.transcribe(path)
+    finally:
+        backend.clear_cache()
+
+
+def _diarize_safe(path: str) -> tuple[list, dict, str]:
+    """Blocking diarization — ALWAYS via ``asyncio.to_thread``. Returns (turns, embeddings, error);
+    a failure degrades to no speakers (error string) instead of failing the transcription job."""
+    try:
+        turns, emb = _diarize(path)
+        return turns, emb, ""
+    except Exception as e:  # noqa: BLE001 — transcript is still good without speakers
+        return [], {}, f"{type(e).__name__}: {e}"
+
+
+@app.get("/health")
+def health() -> dict:
+    return {"status": "ok", "backend": BACKEND_NAME, "model": MODEL_ID,
+            "max_concurrency": MAX_CONCURRENCY, "dia_concurrency": DIA_CONCURRENCY,
+            "in_flight": _inflight, "prewarm": PREWARM or PREWARM_DIARIZER,
+            "diarize_enabled": DIARIZE_ENABLED,
+            "diarize_default": DIARIZE_DEFAULT, "diarize_model": DIARIZE_MODEL,
+            "diarizer_loaded": _diarizer is not None,
+            "loaded": _backend is not None,
+            **({"device": _backend.device} if _backend is not None else {}),
+            **({"diarizer_device": _diarizer_device} if _diarizer is not None else {})}
+
+
+# --- OpenAI-compatible Models API -------------------------------------------------
+_CREATED = 1704067200  # stable "created" timestamp (2024-01-01) — this server serves one model
+
+
+def _model_obj(model_id: str) -> dict:
+    owner = model_id.split("/", 1)[0] if "/" in model_id else BACKEND_NAME
+    return {"id": model_id, "object": "model", "created": _CREATED, "owned_by": owner}
+
+
+@app.get("/v1/models")
+def list_models() -> dict:
+    """OpenAI GET /v1/models — the one model this server has loaded."""
+    return {"object": "list", "data": [_model_obj(MODEL_ID)]}
+
+
+@app.get("/v1/models/{model_id:path}")
+def retrieve_model(model_id: str):
+    """OpenAI GET /v1/models/{id}. An empty id (a trailing-slash /v1/models/) lists; an id that
+    isn't the loaded model returns an OpenAI-shaped 404."""
+    if not model_id:
+        return list_models()
+    if model_id == MODEL_ID:
+        return _model_obj(MODEL_ID)
+    return JSONResponse(status_code=404, content={"error": {
+        "message": f"The model '{model_id}' does not exist",
+        "type": "invalid_request_error", "param": "model", "code": "model_not_found"}})
+
+
+async def _spool_upload(file: UploadFile) -> tuple[str, int]:
+    """Stream the multipart upload to a temp ``.wav`` in 1 MiB chunks (bounded memory — never
+    holds the whole recording in RAM). Returns (path, size_bytes). Enforces
+    ``WHISPER_MAX_UPLOAD_MB`` if set (413)."""
+    cap = MAX_UPLOAD_MB * 1024 * 1024
+    size = 0
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        path = tmp.name
+        while True:
+            chunk = await file.read(1 << 20)  # 1 MiB
+            if not chunk:
+                break
+            size += len(chunk)
+            if cap and size > cap:
+                tmp.close()
+                os.unlink(path)
+                raise HTTPException(status_code=413, detail=f"upload exceeds {MAX_UPLOAD_MB} MiB")
+            tmp.write(chunk)
+    return path, size
+
+
+@app.post("/v1/audio/transcriptions")
+async def transcriptions(file: UploadFile = File(...),
+                         diarize: str | None = Form(None)) -> JSONResponse:
+    """OpenAI-compatible transcription. The ``model`` / ``response_format`` /
+    ``timestamp_granularities[]`` form fields the client sends are accepted and ignored — this
+    server always uses the loaded model and always returns verbose_json + word[].
+    ``diarize=true`` adds ``speaker`` to every word/segment + a ``speakers`` summary."""
+    global _inflight
+    requested_diarize = (DIARIZE_DEFAULT if diarize is None
+                         else diarize.strip().lower() in ("1", "true", "yes", "on"))
+    # Honour the hard kill-switch: if diarization is disabled for this host, ignore the request
+    # (return a plain transcript) rather than attempt a load that could natively abort.
+    want_diarize = requested_diarize and DIARIZE_ENABLED
+    path, size = await _spool_upload(file)
+    if size == 0:
+        os.unlink(path)
+        raise HTTPException(status_code=400, detail="empty file")
+
+    _inflight += 1
+    t0 = time.monotonic()
+    turns: list = []
+    dia_emb: dict = {}
+    dia_err = ""
+    try:
+        async with _asr_sem:  # MLX transcription; extra requests queue here, the loop stays free
+            result = await asyncio.to_thread(_transcribe_only, path)
+        if want_diarize:
+            # Separate semaphore/GPU queue: this diarization overlaps the NEXT episode's
+            # transcription instead of blocking it.
+            async with _dia_sem:
+                turns, dia_emb, dia_err = await asyncio.to_thread(_diarize_safe, path)
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001 — surface the reason instead of a bare 500
+        raise HTTPException(status_code=500, detail=f"transcription failed: {e}") from e
+    finally:
+        _inflight -= 1
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    elapsed = time.monotonic() - t0
+
+    segments = result.get("segments", []) or []
+    # Flatten segment words → the top-level words[] most clients read (real per-word timings).
+    words = [
+        {"word": w.get("word", ""), "start": float(w.get("start", 0.0)), "end": float(w.get("end", 0.0))}
+        for seg in segments for w in (seg.get("words") or [])
+    ]
+    payload: dict = {
+        "task": "transcribe",
+        "language": result.get("language", "en"),
+        "duration": float(segments[-1].get("end", 0.0)) if segments else 0.0,
+        "text": result.get("text", ""),
+        "words": words,        # the primary field clients read (word-level timestamps)
+        "segments": segments,  # kept for the parser's segment fallback + general compatibility
+    }
+    n_speakers = 0
+    if want_diarize and turns:
+        _assign_speakers(words, turns)
+        for seg in segments:  # segment speaker = the turn containing its midpoint
+            mids = [{"start": float(seg.get("start", 0.0)), "end": float(seg.get("end", 0.0))}]
+            _assign_speakers(mids, turns)
+            seg["speaker"] = mids[0].get("speaker")
+        talk: dict[str, float] = {}
+        for ts, te, label in turns:
+            talk[label] = talk.get(label, 0.0) + (te - ts)
+        # `embedding` lets a chunking client link this chunk's speakers to the previous chunks'
+        # (see _speaker_embeddings). Omitted for a speaker whose vector wasn't usable.
+        payload["speakers"] = [{"id": s, "talk_time": round(t, 2),
+                                **({"embedding": dia_emb[s]} if s in dia_emb else {})}
+                               for s, t in sorted(talk.items())]
+        n_speakers = len(talk)
+    elif want_diarize and dia_err:
+        payload["diarization_error"] = dia_err
+    elif requested_diarize and not DIARIZE_ENABLED:
+        payload["diarization_disabled"] = True  # asked for, but disabled on this host
+
+    dur = payload["duration"]
+    rtf = f"{dur / elapsed:.0f}x realtime" if elapsed > 0 else "n/a"
+    dia_note = (f", {n_speakers} speakers" if n_speakers
+                else (f", diarize FAILED: {dia_err}" if dia_err else ""))
+    # Scrub non-finite floats LAST, so nothing above has to care. One NaN would otherwise 500 the
+    # whole request (Starlette serializes with allow_nan=False) and lose the episode.
+    nan_paths: list = []
+    payload = _json_safe(payload, found=nan_paths)
+    if nan_paths:
+        uniq = sorted({p.split("[]")[-1].lstrip(".") or p for p in nan_paths})
+        print(f"[whisper] nulled {len(nan_paths)} non-finite value(s) in {uniq[:4]} "
+              f"(would otherwise have 500'd this request)")
+    print(f"[whisper] {os.path.basename(file.filename or 'audio')}: {size / 1e6:.1f}MB upload, "
+          f"{len(words)} words{dia_note}, {dur:.0f}s audio in {elapsed:.1f}s ({rtf})")
+    return JSONResponse(payload)
