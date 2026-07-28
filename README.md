@@ -12,6 +12,9 @@ per-word speaker labels and per-speaker voiceprints.
 
 ## Features
 
+- **Built-in web UI** at `/` — record from the mic or drop an audio file, transcribe with optional
+  speaker labels, and copy/export the notes (Markdown or plain text). Self-contained (system fonts,
+  no external calls), same field-console styling as SecRouter.
 - **OpenAI-compatible** `POST /v1/audio/transcriptions` (multipart; `verbose_json` with a top-level
   `words[]` array), plus `GET /v1/models` and `GET /health`.
 - **Multi-backend**, one codebase (`WHISPER_BACKEND=auto|mlx|faster-whisper`).
@@ -53,7 +56,7 @@ Omit `secrets.env` to install transcription-only:
 ./install.sh
 ```
 
-Point any OpenAI client at it:
+Open **http://localhost:9000/** for the built-in web UI, or point any OpenAI client at the API:
 
 ```python
 from openai import OpenAI

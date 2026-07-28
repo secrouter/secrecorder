@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SecRecorder</title>
+<style>
+  /* "Field console" theme — matches SecRouter. System fonts only (air-gapped). */
+  :root {
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --bg:#e7e3d8; --panel:#f3f0e8; --panel2:#fbfaf4; --fg:#211f18; --muted:#6c6552;
+    --accent:#4f6a2e; --accent-ink:#f6f3ea; --accent-soft:rgba(79,106,46,.18);
+    --ok:#2f5a22; --warn:#8a5a12; --bad:#8a2b1d;
+    --border:#cdc6b2; --rule:#dad4c2; --shadow:2px 2px 0 rgba(33,31,24,.06);
+    --pill-bg:#e2ddcd; --pill-ok-bg:#e3ebd7; --pill-ok-bd:#b9c9a8;
+    --pill-bad-bg:#f0ddd7; --pill-bad-bd:#d8b3aa; --pill-warn-bg:#efe6cf; --pill-warn-bd:#d8c69a;
+    --code-bg:#e2ddcd;
+  }
+  :root[data-theme="dark"] {
+    --bg:#171511; --panel:#201e17; --panel2:#29271e; --fg:#e8e3d3; --muted:#9a9077;
+    --accent:#94ad50; --accent-ink:#16140e; --accent-soft:rgba(148,173,80,.26);
+    --ok:#86b257; --warn:#cb9c3e; --bad:#d4634c;
+    --border:#3a3730; --rule:#272520; --shadow:2px 2px 0 rgba(0,0,0,.30);
+    --pill-bg:#2b2920; --pill-ok-bg:#26331c; --pill-ok-bd:#3f5230;
+    --pill-bad-bg:#37201a; --pill-bad-bd:#5c2f25; --pill-warn-bg:#332a17; --pill-warn-bd:#544321;
+    --code-bg:#2b2920;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:#171511; --panel:#201e17; --panel2:#29271e; --fg:#e8e3d3; --muted:#9a9077;
+      --accent:#94ad50; --accent-ink:#16140e; --accent-soft:rgba(148,173,80,.26);
+      --ok:#86b257; --warn:#cb9c3e; --bad:#d4634c;
+      --border:#3a3730; --rule:#272520; --shadow:2px 2px 0 rgba(0,0,0,.30);
+      --pill-bg:#2b2920; --pill-ok-bg:#26331c; --pill-ok-bd:#3f5230;
+      --pill-bad-bg:#37201a; --pill-bad-bd:#5c2f25; --pill-warn-bg:#332a17; --pill-warn-bd:#544321;
+      --code-bg:#2b2920;
+    }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.55 var(--sans); background:var(--bg); color:var(--fg);
+         background-image:linear-gradient(var(--rule) 1px, transparent 1px); background-size:100% 28px; background-attachment:fixed; }
+  header { display:flex; align-items:center; gap:14px; padding:14px 22px; background:var(--panel);
+           border-bottom:1px solid var(--border); border-top:3px solid var(--accent); }
+  header h1 { font-size:15px; margin:0; font-weight:700; text-transform:uppercase; letter-spacing:.14em; display:flex; align-items:center; gap:10px; }
+  header h1 .sec { color:var(--accent); }
+  header .status { margin-left:auto; display:flex; gap:8px; align-items:center; }
+  main { padding:24px 22px; max-width:960px; margin:0 auto; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:2px; padding:18px; margin-bottom:16px; box-shadow:var(--shadow); }
+  .card h3 { margin:0 0 14px; font:11px var(--mono); font-weight:700; text-transform:uppercase; letter-spacing:.12em;
+          color:var(--muted); display:flex; align-items:center; gap:8px; padding-bottom:8px; border-bottom:1px solid var(--rule); }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin:10px 0; }
+  label.f { color:var(--muted); font:11px var(--mono); text-transform:uppercase; letter-spacing:.06em; }
+  input[type=checkbox] { accent-color:var(--accent); width:15px; height:15px; vertical-align:middle; }
+  button.btn { background:var(--accent); color:var(--accent-ink); border:1px solid var(--accent); border-radius:2px;
+               padding:8px 16px; cursor:pointer; font:11px var(--mono); text-transform:uppercase; letter-spacing:.08em; }
+  button.btn:hover:not(:disabled) { filter:brightness(1.08); }
+  button.btn:disabled { opacity:.45; cursor:not-allowed; }
+  button.btn.ghost { background:var(--panel2); color:var(--fg); border-color:var(--border); }
+  button.btn.rec { background:var(--bad); border-color:var(--bad); }
+  button.btn.big { padding:11px 22px; font-size:12px; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:2px; font:10px var(--mono); text-transform:uppercase; letter-spacing:.06em;
+          background:var(--pill-bg); color:var(--muted); border:1px solid var(--border); }
+  .pill.ok { color:var(--ok); border-color:var(--pill-ok-bd); background:var(--pill-ok-bg); }
+  .pill.bad { color:var(--bad); border-color:var(--pill-bad-bd); background:var(--pill-bad-bg); }
+  .pill.warn { color:var(--warn); border-color:var(--pill-warn-bd); background:var(--pill-warn-bg); }
+  .muted { color:var(--muted); }
+  .theme-toggle { padding:5px 11px; }
+  .drop { border:1.5px dashed var(--border); border-radius:3px; padding:20px; text-align:center; color:var(--muted); font:12px var(--mono);
+          cursor:pointer; transition:border-color .15s, background .15s; }
+  .drop:hover, .drop.over { border-color:var(--accent); background:var(--accent-soft); color:var(--fg); }
+  .rec-dot { width:10px; height:10px; border-radius:50%; background:var(--bad); display:inline-block; animation:pulse 1.1s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.25} }
+  .divider { display:flex; align-items:center; gap:12px; color:var(--muted); font:10px var(--mono); text-transform:uppercase; letter-spacing:.14em; margin:14px 0; }
+  .divider::before, .divider::after { content:""; height:1px; background:var(--rule); flex:1; }
+  .src { font:12px var(--mono); color:var(--fg); }
+  .meta { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
+  .turn { padding:9px 0; border-bottom:1px solid var(--rule); }
+  .turn:last-child { border-bottom:none; }
+  .turn .spk { font:10px var(--mono); font-weight:700; text-transform:uppercase; letter-spacing:.08em; padding:2px 7px; border-radius:2px; margin-right:8px; }
+  .turn .ts { color:var(--muted); font:10px var(--mono); margin-left:6px; }
+  .turn .txt { }
+  #transcript { max-height:52vh; overflow:auto; }
+  .plain { white-space:pre-wrap; font:13.5px/1.7 var(--sans); }
+  .spinner { width:15px; height:15px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; display:inline-block;
+             animation:spin .7s linear infinite; vertical-align:middle; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .hidden { display:none !important; }
+  a.dl { color:var(--accent); text-decoration:none; font:11px var(--mono); text-transform:uppercase; letter-spacing:.06em; }
+</style>
+<script>
+  (function(){ try { var t = localStorage.getItem('secrecorder-theme'); if (t==='dark'||t==='light') document.documentElement.setAttribute('data-theme', t); } catch(e){} })();
+</script>
+</head>
+<body>
+  <header>
+    <h1><span class="sec">SEC</span>RECORDER <span class="pill">aka SpeakerBox</span></h1>
+    <div class="status">
+      <span id="health" class="pill">checking…</span>
+      <button class="btn ghost theme-toggle" id="themeBtn" title="Toggle theme">◐</button>
+    </div>
+  </header>
+
+  <main>
+    <div class="card">
+      <h3>Capture</h3>
+      <div class="row">
+        <button class="btn rec big" id="recBtn">● Start recording</button>
+        <span id="recTimer" class="src hidden"><span class="rec-dot"></span> <span id="recTime">0:00</span></span>
+      </div>
+      <div id="recNote" class="muted" style="font:11px var(--mono)"></div>
+
+      <div class="divider">or</div>
+
+      <div class="drop" id="drop">Drop an audio file here, or click to choose <span class="muted">(wav · mp3 · m4a · webm · flac · ogg)</span></div>
+      <input type="file" id="fileIn" accept="audio/*,.wav,.mp3,.m4a,.webm,.flac,.ogg,.opus" class="hidden" />
+
+      <div class="row" style="margin-top:16px; justify-content:space-between">
+        <span id="source" class="src muted">No audio selected.</span>
+        <span>
+          <label class="f" id="diaLabel"><input type="checkbox" id="diarize" /> Label speakers</label>
+          &nbsp;
+          <button class="btn big" id="goBtn" disabled>Transcribe</button>
+        </span>
+      </div>
+    </div>
+
+    <div class="card hidden" id="resultCard">
+      <h3>Transcript <span id="statusPill" class="pill"></span></h3>
+      <div class="meta" id="meta"></div>
+      <div class="row" id="toolbar" style="margin-top:0">
+        <label class="f"><input type="checkbox" id="showTs" /> timestamps</label>
+        <button class="btn ghost" id="copyBtn">Copy</button>
+        <a class="dl" id="dlTxt" href="#">Download .txt</a>
+        <a class="dl" id="dlMd" href="#">Download .md</a>
+      </div>
+      <div id="transcript" style="margin-top:12px"></div>
+    </div>
+  </main>
+
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+
+// ── theme ──
+$("#themeBtn").onclick = () => {
+  const cur = document.documentElement.getAttribute("data-theme")
+    || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  const next = cur === "dark" ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", next);
+  try { localStorage.setItem("secrecorder-theme", next); } catch (e) {}
+};
+
+// ── state ──
+const state = { blob: null, name: null, rec: null, chunks: [], t0: 0, timer: null, result: null };
+
+// ── health ──
+async function health() {
+  try {
+    const h = await (await fetch("/health")).json();
+    const el = $("#health");
+    el.className = "pill ok";
+    el.textContent = (h.backend || "ready") + " · " + (h.model || "").split("/").pop();
+    el.title = "model: " + h.model + " · device: " + (h.device || "?");
+    if (!h.diarize_enabled) {
+      $("#diarize").checked = false; $("#diarize").disabled = true;
+      $("#diaLabel").title = "Diarization is disabled on this server (WHISPER_ALLOW_DIARIZE=0 or no HF_TOKEN).";
+      $("#diaLabel").style.opacity = ".5";
+    } else if (h.diarize_default) {
+      $("#diarize").checked = true;
+    }
+  } catch (e) {
+    const el = $("#health"); el.className = "pill bad"; el.textContent = "unreachable";
+  }
+}
+
+// ── select audio (recording or file) ──
+function setSource(blob, name) {
+  state.blob = blob; state.name = name;
+  const secs = "";
+  $("#source").textContent = name + (blob.size ? "  ·  " + (blob.size / 1048576).toFixed(1) + " MB" : "");
+  $("#source").classList.remove("muted");
+  $("#goBtn").disabled = false;
+}
+
+// ── recording ──
+const canRecord = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
+if (!canRecord) {
+  $("#recBtn").disabled = true;
+  $("#recNote").textContent = window.isSecureContext
+    ? "Recording not supported in this browser — upload a file instead."
+    : "Mic recording needs localhost or HTTPS (this origin is insecure) — upload a file instead.";
+}
+function pickMime() {
+  const c = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
+  for (const m of c) if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) return m;
+  return "";
+}
+$("#recBtn").onclick = async () => {
+  if (state.rec && state.rec.state === "recording") { state.rec.stop(); return; }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) { $("#recNote").textContent = "Microphone access denied."; return; }
+  const mime = pickMime();
+  state.chunks = [];
+  state.rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+  state.rec.ondataavailable = (e) => { if (e.data.size) state.chunks.push(e.data); };
+  state.rec.onstop = () => {
+    stream.getTracks().forEach((t) => t.stop());
+    clearInterval(state.timer);
+    $("#recTimer").classList.add("hidden");
+    $("#recBtn").classList.add("rec"); $("#recBtn").textContent = "● Start recording";
+    const type = (state.chunks[0] && state.chunks[0].type) || mime || "audio/webm";
+    const ext = type.indexOf("mp4") >= 0 ? "m4a" : type.indexOf("ogg") >= 0 ? "ogg" : "webm";
+    const blob = new Blob(state.chunks, { type });
+    setSource(blob, "recording-" + stamp() + "." + ext);
+  };
+  state.rec.start();
+  state.t0 = Date.now();
+  $("#recBtn").classList.remove("rec"); $("#recBtn").textContent = "■ Stop recording";
+  $("#recBtn").style.background = "var(--muted)";
+  $("#recTimer").classList.remove("hidden");
+  state.timer = setInterval(() => { $("#recTime").textContent = fmt((Date.now() - state.t0) / 1000); }, 250);
+};
+$("#recBtn").addEventListener("click", () => {
+  if (state.rec && state.rec.state === "recording") { $("#recBtn").classList.add("rec"); $("#recBtn").style.background = ""; }
+});
+
+// ── file upload / drag-drop ──
+const drop = $("#drop"), fileIn = $("#fileIn");
+drop.onclick = () => fileIn.click();
+fileIn.onchange = () => { if (fileIn.files[0]) setSource(fileIn.files[0], fileIn.files[0].name); };
+["dragenter", "dragover"].forEach((e) => drop.addEventListener(e, (ev) => { ev.preventDefault(); drop.classList.add("over"); }));
+["dragleave", "drop"].forEach((e) => drop.addEventListener(e, (ev) => { ev.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", (ev) => { const f = ev.dataTransfer.files[0]; if (f) setSource(f, f.name); });
+
+// ── transcribe ──
+$("#goBtn").onclick = async () => {
+  if (!state.blob) return;
+  const card = $("#resultCard"); card.classList.remove("hidden");
+  const status = $("#statusPill"); status.className = "pill warn";
+  status.innerHTML = '<span class="spinner"></span> transcribing…';
+  $("#transcript").innerHTML = ""; $("#meta").innerHTML = "";
+  $("#goBtn").disabled = true;
+  const fd = new FormData();
+  fd.append("file", state.blob, state.name);
+  fd.append("diarize", $("#diarize").checked ? "true" : "false");
+  const t0 = performance.now();
+  try {
+    const r = await fetch("/v1/audio/transcriptions", { method: "POST", body: fd });
+    if (!r.ok) {
+      let msg = "HTTP " + r.status;
+      try { const j = await r.json(); msg = j.detail || j.error?.message || msg; } catch (e) {}
+      throw new Error(msg);
+    }
+    const data = await r.json();
+    state.result = data;
+    status.className = "pill ok"; status.textContent = ((performance.now() - t0) / 1000).toFixed(1) + "s";
+    render(data);
+  } catch (e) {
+    status.className = "pill bad"; status.textContent = "failed";
+    $("#transcript").innerHTML = '<div class="muted">' + escapeHtml(e.message) + "</div>";
+  } finally {
+    $("#goBtn").disabled = false;
+  }
+};
+
+// ── render transcript ──
+const SPK_COLORS = ["#4f6a2e", "#8a5a12", "#8a2b1d", "#2f5a22", "#5a4a8a", "#1d6a7a", "#7a5a1d", "#6a2e5a"];
+function spkStyle(idx) {
+  const c = SPK_COLORS[idx % SPK_COLORS.length];
+  return "background:" + c + "22;color:" + c + ";border:1px solid " + c + "55";
+}
+function render(data) {
+  const segs = data.segments || [];
+  const diarized = segs.some((s) => s.speaker);
+  // meta chips
+  const chips = [];
+  if (data.language) chips.push(pill(data.language.toUpperCase()));
+  if (data.duration) chips.push(pill(fmt(data.duration) + " audio"));
+  if (data.speakers && data.speakers.length) chips.push(pill(data.speakers.length + " speaker" + (data.speakers.length > 1 ? "s" : "")));
+  if (data.diarization_error) chips.push('<span class="pill warn" title="' + escapeHtml(data.diarization_error) + '">diarization skipped</span>');
+  $("#meta").innerHTML = chips.join("");
+
+  const out = $("#transcript");
+  if (diarized) {
+    // map raw speaker ids → Speaker 1..N in first-appearance order; group consecutive segments
+    const order = [], turns = [];
+    for (const s of segs) {
+      const raw = s.speaker || "?";
+      if (order.indexOf(raw) < 0) order.push(raw);
+      const idx = order.indexOf(raw);
+      const last = turns[turns.length - 1];
+      if (last && last.idx === idx) { last.end = s.end; last.text += " " + (s.text || "").trim(); }
+      else turns.push({ idx, raw, start: s.start, end: s.end, text: (s.text || "").trim() });
+    }
+    out.innerHTML = turns.map((t) =>
+      '<div class="turn"><span class="spk" style="' + spkStyle(t.idx) + '">Speaker ' + (t.idx + 1) + '</span>'
+      + '<span class="ts show-ts">' + fmt(t.start) + "–" + fmt(t.end) + "</span>"
+      + '<div class="txt" style="margin-top:4px">' + escapeHtml(t.text) + "</div></div>"
+    ).join("");
+  } else if (segs.length) {
+    out.innerHTML = segs.map((s) =>
+      '<div class="turn"><span class="ts show-ts">' + fmt(s.start) + "</span> "
+      + '<span class="txt">' + escapeHtml((s.text || "").trim()) + "</span></div>"
+    ).join("");
+  } else {
+    out.innerHTML = '<div class="plain">' + escapeHtml(data.text || "(no speech detected)") + "</div>";
+  }
+  applyTs();
+  // exports
+  const txt = plainText(data, diarized), md = markdown(data, diarized);
+  wireDownload($("#dlTxt"), txt, "transcript-" + stamp() + ".txt", "text/plain");
+  wireDownload($("#dlMd"), md, "transcript-" + stamp() + ".md", "text/markdown");
+  $("#copyBtn").onclick = async () => {
+    try { await navigator.clipboard.writeText(txt); $("#copyBtn").textContent = "Copied ✓"; setTimeout(() => ($("#copyBtn").textContent = "Copy"), 1400); }
+    catch (e) { $("#copyBtn").textContent = "Copy failed"; }
+  };
+}
+$("#showTs").onchange = applyTs;
+function applyTs() {
+  const on = $("#showTs").checked;
+  document.querySelectorAll(".show-ts").forEach((e) => (e.style.display = on ? "" : "none"));
+}
+
+// ── export builders ──
+function plainText(data, diarized) {
+  const segs = data.segments || [];
+  if (diarized) {
+    const order = [], lines = [];
+    for (const s of segs) {
+      const raw = s.speaker || "?"; if (order.indexOf(raw) < 0) order.push(raw);
+      lines.push("Speaker " + (order.indexOf(raw) + 1) + ": " + (s.text || "").trim());
+    }
+    return lines.join("\n");
+  }
+  return (data.text || "").trim();
+}
+function markdown(data, diarized) {
+  const d = new Date();
+  let md = "# Meeting transcript\n\n_" + d.toISOString().slice(0, 16).replace("T", " ") + " · " + (data.language || "") + " · " + fmt(data.duration || 0) + "_\n\n";
+  const segs = data.segments || [];
+  if (diarized) {
+    const order = [];
+    for (const s of segs) {
+      const raw = s.speaker || "?"; if (order.indexOf(raw) < 0) order.push(raw);
+      md += "**Speaker " + (order.indexOf(raw) + 1) + "** (" + fmt(s.start) + "): " + (s.text || "").trim() + "\n\n";
+    }
+  } else {
+    md += (data.text || "").trim() + "\n";
+  }
+  return md;
+}
+function wireDownload(a, text, name, type) {
+  a.onclick = (e) => {
+    e.preventDefault();
+    const url = URL.createObjectURL(new Blob([text], { type }));
+    const t = document.createElement("a"); t.href = url; t.download = name; t.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+}
+
+// ── helpers ──
+function pill(t) { return '<span class="pill">' + escapeHtml(String(t)) + "</span>"; }
+function fmt(s) { s = Math.max(0, Math.round(s || 0)); const m = Math.floor(s / 60); return m + ":" + String(s % 60).padStart(2, "0"); }
+function stamp() { const d = new Date(); const p = (n) => String(n).padStart(2, "0"); return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + "-" + p(d.getHours()) + p(d.getMinutes()); }
+function escapeHtml(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+
+health();
+</script>
+</body>
+</html>

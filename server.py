@@ -52,7 +52,7 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 BACKEND = os.environ.get("WHISPER_BACKEND", "auto").strip().lower()
 MODEL = os.environ.get("WHISPER_MODEL", "").strip()  # empty → per-backend default below
@@ -204,6 +204,15 @@ async def _lifespan(_app):
 
 app = FastAPI(title="SecRecorder", version="0.6.1", lifespan=_lifespan)
 
+# Built-in web UI (record / upload -> transcribe), served same-origin as the API.
+# Read once at startup from ui.html next to this file; optional (API works without it).
+_UI_HTML = ""
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui.html"), encoding="utf-8") as _f:
+        _UI_HTML = _f.read()
+except OSError:
+    pass
+
 _diarizer = None  # lazy-loaded pyannote pipeline (first diarize request pays the load)
 _diarizer_device = ""
 _diarizer_lock = threading.Lock()
@@ -347,6 +356,15 @@ def _diarize_safe(path: str) -> tuple[list, dict, str]:
         return turns, emb, ""
     except Exception as e:  # noqa: BLE001 — transcript is still good without speakers
         return [], {}, f"{type(e).__name__}: {e}"
+
+
+@app.get("/", response_class=HTMLResponse)
+def ui() -> HTMLResponse:
+    """Built-in web UI: record from the mic or upload a file, then transcribe (with optional
+    speaker labels). Same-origin as the API, so no CORS. Disabled if ui.html is missing."""
+    if not _UI_HTML:
+        return HTMLResponse("<h1>SecRecorder</h1><p>UI unavailable (ui.html not found next to server.py). The API is at <code>/v1/audio/transcriptions</code>.</p>")
+    return HTMLResponse(_UI_HTML)
 
 
 @app.get("/health")
