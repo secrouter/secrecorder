@@ -133,9 +133,10 @@ class MlxBackend:
         self.device = "mps"
         self._mx = mx
 
-    def transcribe(self, path: str) -> dict:
+    def transcribe(self, path: str, initial_prompt: str | None = None) -> dict:
         import mlx_whisper
-        return mlx_whisper.transcribe(path, path_or_hf_repo=self.model_id, word_timestamps=True)
+        return mlx_whisper.transcribe(path, path_or_hf_repo=self.model_id, word_timestamps=True,
+                                      initial_prompt=initial_prompt)
 
     def clear_cache(self) -> None:
         for fn in (getattr(self._mx, "clear_cache", None),
@@ -158,8 +159,8 @@ class FasterWhisperBackend:
         self.compute_type = compute_type
         self._model = WhisperModel(model_id, device=device, compute_type=compute_type)
 
-    def transcribe(self, path: str) -> dict:
-        segments, info = self._model.transcribe(path, word_timestamps=True)
+    def transcribe(self, path: str, initial_prompt: str | None = None) -> dict:
+        segments, info = self._model.transcribe(path, word_timestamps=True, initial_prompt=initial_prompt)
         out = []
         for s in segments:  # generator — consuming it runs the transcription
             out.append({
@@ -413,12 +414,13 @@ def _assign_speakers(words: list[dict], turns: list[tuple[float, float, str]]) -
         w["speaker"] = best
 
 
-def _transcribe_only(path: str) -> dict:
+def _transcribe_only(path: str, initial_prompt: str | None = None) -> dict:
     """Blocking transcription — ALWAYS called via ``asyncio.to_thread`` so it never blocks the event
-    loop. Releases the backend GPU cache afterwards so the next large job starts clean."""
+    loop. ``initial_prompt`` biases/continues decoding (OpenAI ``prompt``), used by live mode to
+    carry the last committed text across rolling windows. Releases the GPU cache afterwards."""
     backend = _get_backend()
     try:
-        return backend.transcribe(path)
+        return backend.transcribe(path, initial_prompt=initial_prompt)
     finally:
         backend.clear_cache()
 
@@ -607,7 +609,8 @@ async def _spool_upload(file: UploadFile) -> tuple[str, int]:
 @app.post("/v1/audio/transcriptions")
 async def transcriptions(file: UploadFile = File(...),
                          diarize: str | None = Form(None),
-                         identify: str | None = Form(None)) -> JSONResponse:
+                         identify: str | None = Form(None),
+                         prompt: str | None = Form(None)) -> JSONResponse:
     """OpenAI-compatible transcription. The ``model`` / ``response_format`` /
     ``timestamp_granularities[]`` form fields the client sends are accepted and ignored — this
     server always uses the loaded model and always returns verbose_json + word[].
@@ -634,7 +637,7 @@ async def transcriptions(file: UploadFile = File(...),
     dia_err = ""
     try:
         async with _asr_sem:  # MLX transcription; extra requests queue here, the loop stays free
-            result = await asyncio.to_thread(_transcribe_only, path)
+            result = await asyncio.to_thread(_transcribe_only, path, prompt)
         if want_diarize:
             # Separate semaphore/GPU queue: this diarization overlaps the NEXT episode's
             # transcription instead of blocking it.

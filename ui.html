@@ -122,6 +122,8 @@
       <div class="row" style="margin-top:16px; justify-content:space-between">
         <span id="source" class="src muted">No audio selected.</span>
         <span>
+          <label class="f" id="liveLabel"><input type="checkbox" id="live" /> Live</label>
+          &nbsp;
           <label class="f" id="diaLabel"><input type="checkbox" id="diarize" /> Label speakers</label>
           &nbsp;
           <label class="f" id="idLabel"><input type="checkbox" id="identify" /> Recognize</label>
@@ -326,11 +328,17 @@ $("#recBtn").onclick = async () => {
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: true });
   } catch (e) { $("#recNote").textContent = "Microphone access denied."; return; }
+  state.liveActive = LIVE_OK && $("#live").checked;
+  if (state.liveActive) {
+    try { await startLive(stream); }
+    catch (e) { state.liveActive = false; $("#recNote").textContent = "Live init failed: " + e.message; }
+  }
   const mime = pickMime();
   state.chunks = [];
   state.rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
   state.rec.ondataavailable = (e) => { if (e.data.size) state.chunks.push(e.data); };
   state.rec.onstop = () => {
+    if (state.liveActive) stopLive();
     stream.getTracks().forEach((t) => t.stop());
     clearInterval(state.timer);
     $("#recTimer").classList.add("hidden");
@@ -339,6 +347,8 @@ $("#recBtn").onclick = async () => {
     const ext = type.indexOf("mp4") >= 0 ? "m4a" : type.indexOf("ogg") >= 0 ? "ogg" : "webm";
     const blob = new Blob(state.chunks, { type });
     setSource(blob, "recording-" + stamp() + "." + ext);
+    // live was a preview — now run the full recording through the accurate diarized/recognized pass
+    if (state.liveActive) { state.liveActive = false; runTranscribe(); }
   };
   state.rec.start();
   state.t0 = Date.now();
@@ -359,8 +369,8 @@ fileIn.onchange = () => { if (fileIn.files[0]) setSource(fileIn.files[0], fileIn
 ["dragleave", "drop"].forEach((e) => drop.addEventListener(e, (ev) => { ev.preventDefault(); drop.classList.remove("over"); }));
 drop.addEventListener("drop", (ev) => { const f = ev.dataTransfer.files[0]; if (f) setSource(f, f.name); });
 
-// ── transcribe ──
-$("#goBtn").onclick = async () => {
+// ── transcribe (whole-file accurate pass; also the "final pass" after live) ──
+async function runTranscribe() {
   if (!state.blob) return;
   const card = $("#resultCard"); card.classList.remove("hidden");
   const status = $("#statusPill"); status.className = "pill warn";
@@ -391,7 +401,126 @@ $("#goBtn").onclick = async () => {
   } finally {
     $("#goBtn").disabled = false;
   }
-};
+}
+$("#goBtn").onclick = runTranscribe;
+
+// ── live transcription (MVP): rolling overlapping windows + LocalAgreement-2 ──
+// Capture raw PCM (AudioWorklet) → downsample to 16 kHz → every ~1s POST the uncommitted tail as a
+// WAV window with the committed text as `prompt` for continuity. Commit the longest word-prefix two
+// consecutive hypotheses agree on (stable text); show the rest as a grey volatile tail. On Stop, the
+// full recording is run through the normal accurate pass (diarization + recognition) to replace it.
+const LIVE_OK = canRecord && window.isSecureContext
+  && !!(window.AudioContext || window.webkitAudioContext) && !!window.AudioWorkletNode;
+const LIVE_RATE = 16000, LIVE_STEP_MS = 1000, LIVE_MAX_WIN = 28;   // seconds of audio per window, capped
+const live = { on: false, ctx: null, node: null, zero: null, samples: [], rsPos: 0, inRate: 0,
+               base: 0, busy: false, timer: null, committed: [], prevHyp: [], lastTime: 0, promptTail: "" };
+
+if (!LIVE_OK) {
+  $("#live").disabled = true; $("#liveLabel").style.opacity = ".5";
+  $("#liveLabel").title = window.isSecureContext
+    ? "Live needs AudioWorklet support in this browser."
+    : "Live needs localhost or HTTPS (mic capture is blocked on insecure origins).";
+} else {
+  $("#liveLabel").title = "Show a rolling live transcript while recording; the accurate diarized/recognized transcript is produced when you stop.";
+}
+
+const WORKLET_SRC = 'class C extends AudioWorkletProcessor{process(i){const c=i[0]&&i[0][0];if(c)this.port.postMessage(c.slice(0));return true;}}registerProcessor("cap",C);';
+
+async function startLive(stream) {
+  Object.assign(live, { on: true, samples: [], rsPos: 0, base: 0, busy: false,
+                        committed: [], prevHyp: [], lastTime: 0, promptTail: "" });
+  const AC = window.AudioContext || window.webkitAudioContext;
+  live.ctx = new AC();
+  live.inRate = live.ctx.sampleRate;
+  if (live.ctx.state === "suspended") { try { await live.ctx.resume(); } catch (e) {} }
+  await live.ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET_SRC], { type: "application/javascript" })));
+  live.node = new AudioWorkletNode(live.ctx, "cap");
+  live.node.port.onmessage = (e) => onPcm(e.data);
+  const src = live.ctx.createMediaStreamSource(stream);
+  live.zero = live.ctx.createGain(); live.zero.gain.value = 0;      // keep the graph pulling, silently
+  src.connect(live.node); live.node.connect(live.zero); live.zero.connect(live.ctx.destination);
+  $("#resultCard").classList.remove("hidden");
+  $("#meta").innerHTML = ""; $("#speakerPanel").classList.add("hidden");
+  const st = $("#statusPill"); st.className = "pill warn"; st.innerHTML = '<span class="rec-dot"></span> live';
+  renderLive();
+  live.timer = setInterval(liveTick, LIVE_STEP_MS);
+}
+
+function onPcm(frame) {   // downsample inRate -> 16 kHz (nearest-neighbour; fine for speech)
+  const ratio = live.inRate / LIVE_RATE, s = live.samples;
+  let pos = live.rsPos;
+  while (pos < frame.length) { s.push(frame[Math.floor(pos)]); pos += ratio; }
+  live.rsPos = pos - frame.length;
+}
+
+async function liveTick() {
+  if (!live.on || live.busy) return;
+  const maxSamp = LIVE_MAX_WIN * LIVE_RATE;
+  if (live.samples.length > maxSamp) {   // agreement stalled — force the window to stay bounded
+    const drop = live.samples.length - maxSamp;
+    live.samples.splice(0, drop); live.base += drop / LIVE_RATE;
+  }
+  if (live.samples.length < LIVE_RATE * 0.6) return;   // wait for >= 0.6s of new audio
+  live.busy = true;
+  const win = live.samples.slice(), winBase = live.base;
+  try {
+    const fd = new FormData();
+    fd.append("file", encodeWav(win), "live.wav");
+    fd.append("diarize", "false");
+    if (live.promptTail) fd.append("prompt", live.promptTail);
+    const r = await fetch("/v1/audio/transcriptions", { method: "POST", body: fd });
+    if (!live.on || !r.ok) return;
+    const d = await r.json();
+    const words = (d.words || []).map((w) => [winBase + (+w.start || 0), winBase + (+w.end || 0), w.word]);
+    commitLocalAgreement(words);
+    renderLive();
+  } catch (e) { /* transient network/decoding hiccup — the next tick retries */ }
+  finally { live.busy = false; }
+}
+
+function normw(w) { return (w || "").trim().toLowerCase().replace(/^[.,!?;:"'—-]+|[.,!?;:"'—-]+$/g, ""); }
+function commitLocalAgreement(newAbs) {
+  const nw = newAbs.filter((x) => x[1] > live.lastTime - 0.1);   // ignore already-committed region
+  const prev = live.prevHyp;
+  let i = 0;
+  while (i < nw.length && i < prev.length && normw(nw[i][2]) === normw(prev[i][2])) {
+    live.committed.push(nw[i]); live.lastTime = nw[i][1]; i++;
+  }
+  live.prevHyp = nw.slice(i);
+  const keep = Math.max(0, Math.round((live.lastTime - live.base) * LIVE_RATE));
+  if (keep > 0) { live.samples.splice(0, keep); live.base = live.lastTime; }   // drop committed audio
+  live.promptTail = live.committed.map((w) => w[2]).join("").slice(-200).trim();
+}
+
+function stopLive() {
+  live.on = false;
+  if (live.timer) { clearInterval(live.timer); live.timer = null; }
+  try { if (live.node) { live.node.port.onmessage = null; live.node.disconnect(); } } catch (e) {}
+  try { if (live.zero) live.zero.disconnect(); } catch (e) {}
+  try { if (live.ctx) live.ctx.close(); } catch (e) {}
+  live.committed = live.committed.concat(live.prevHyp); live.prevHyp = [];   // accept the tail at end-of-stream
+  renderLive();
+}
+
+function liveText() { return live.committed.map((w) => w[2]).join("").replace(/\s+/g, " ").trim(); }
+function renderLive() {
+  const committed = escapeHtml(liveText());
+  const tail = escapeHtml(live.prevHyp.map((w) => w[2]).join("").replace(/\s+/g, " ").trim());
+  $("#transcript").innerHTML = '<div class="plain">' + (committed || '<span class="muted">listening…</span>')
+    + (tail ? ' <span class="muted">' + tail + "</span>" : "")
+    + (live.on ? ' <span class="spinner" style="width:11px;height:11px"></span>' : "") + "</div>";
+}
+
+function encodeWav(samples) {   // 16-bit mono PCM WAV at LIVE_RATE
+  const n = samples.length, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); ws(8, "WAVE"); ws(12, "fmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, LIVE_RATE, true); v.setUint32(28, LIVE_RATE * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  ws(36, "data"); v.setUint32(40, n * 2, true);
+  let o = 44; for (let i = 0; i < n; i++) { const x = Math.max(-1, Math.min(1, samples[i])); v.setInt16(o, x < 0 ? x * 0x8000 : x * 0x7fff, true); o += 2; }
+  return new Blob([buf], { type: "audio/wav" });
+}
 
 // ── render transcript ──
 const SPK_COLORS = ["#4f6a2e", "#8a5a12", "#8a2b1d", "#2f5a22", "#5a4a8a", "#1d6a7a", "#7a5a1d", "#6a2e5a"];
