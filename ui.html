@@ -87,6 +87,10 @@
   @keyframes spin { to { transform:rotate(360deg); } }
   .hidden { display:none !important; }
   a.dl { color:var(--accent); text-decoration:none; font:11px var(--mono); text-transform:uppercase; letter-spacing:.06em; }
+  input[type=text].nm { background:var(--panel2); color:var(--fg); border:1px solid var(--border); border-radius:2px; padding:6px 9px; font:13px var(--sans); }
+  .spkrow { display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:9px 0; border-bottom:1px solid var(--rule); }
+  .spkrow:last-child { border-bottom:none; }
+  .spkrow .grow { flex:1; min-width:120px; }
 </style>
 <script>
   (function(){ try { var t = localStorage.getItem('secrecorder-theme'); if (t==='dark'||t==='light') document.documentElement.setAttribute('data-theme', t); } catch(e){} })();
@@ -120,6 +124,8 @@
         <span>
           <label class="f" id="diaLabel"><input type="checkbox" id="diarize" /> Label speakers</label>
           &nbsp;
+          <label class="f" id="idLabel"><input type="checkbox" id="identify" /> Recognize</label>
+          &nbsp;
           <button class="btn big" id="goBtn" disabled>Transcribe</button>
         </span>
       </div>
@@ -135,6 +141,15 @@
         <a class="dl" id="dlMd" href="#">Download .md</a>
       </div>
       <div id="transcript" style="margin-top:12px"></div>
+      <div id="speakerPanel" class="hidden" style="margin-top:16px">
+        <div class="divider">speakers in this recording</div>
+        <div id="speakerList"></div>
+      </div>
+    </div>
+
+    <div class="card hidden" id="libraryCard">
+      <h3>Speaker library <span id="libCount" class="pill"></span></h3>
+      <div id="libraryList" class="muted">No speakers enrolled yet.</div>
     </div>
   </main>
 
@@ -169,9 +184,118 @@ async function health() {
     } else if (h.diarize_default) {
       $("#diarize").checked = true;
     }
+    setupLibrary(h);
   } catch (e) {
     const el = $("#health"); el.className = "pill bad"; el.textContent = "unreachable";
   }
+}
+
+// ── speaker library (enroll named voiceprints; recognize them across recordings) ──
+function setupLibrary(h) {
+  const idLabel = $("#idLabel");
+  if (h.speaker_library_enabled !== true) {   // feature off (or a server that predates it)
+    idLabel.classList.add("hidden");
+    $("#libraryCard").classList.add("hidden");
+    return;
+  }
+  // Recognition needs the per-speaker voiceprints that only diarization produces.
+  if (!h.diarize_enabled) {
+    $("#identify").checked = false; $("#identify").disabled = true;
+    idLabel.title = "Recognition needs diarization, which is disabled on this server.";
+    idLabel.style.opacity = ".5";
+  } else if (h.identify_default) {
+    $("#identify").checked = true;
+  }
+  $("#libraryCard").classList.remove("hidden");
+  loadLibrary();
+}
+
+async function loadLibrary() {
+  const list = $("#libraryList"), count = $("#libCount");
+  try {
+    const res = await fetch("/v1/speakers");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = (await res.json()).data || [];
+    count.textContent = data.length + (data.length === 1 ? " speaker" : " speakers");
+    if (!data.length) { list.className = "muted"; list.textContent = "No speakers enrolled yet."; return; }
+    list.className = ""; list.innerHTML = "";
+    data.forEach((s) => {
+      const row = document.createElement("div"); row.className = "spkrow";
+      row.innerHTML = '<span class="grow"><b>' + escapeHtml(s.name) + "</b> "
+        + '<span class="pill">' + s.samples + (s.samples === 1 ? " sample" : " samples") + "</span></span>"
+        + '<button class="btn ghost">Delete</button>';
+      row.querySelector("button").onclick = () => deleteSpeaker(s.id, s.name, row);
+      list.appendChild(row);
+    });
+  } catch (e) { /* library unreachable — leave the card as-is */ }
+}
+
+async function deleteSpeaker(id, name, row) {
+  if (!confirm('Remove speaker "' + name + '" from the library?')) return;
+  try {
+    const r = await fetch("/v1/speakers/" + encodeURIComponent(id), { method: "DELETE" });
+    if (r.ok) { row.remove(); loadLibrary(); }
+  } catch (e) {}
+}
+
+async function enrollSpeaker(name, embedding, row) {
+  name = (name || "").trim();
+  if (!name) return;
+  const btn = row.querySelector("button"); if (btn) { btn.disabled = true; btn.textContent = "Saving…"; }
+  try {
+    const r = await fetch("/v1/speakers", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name, embedding: embedding, source: "ui" }),
+    });
+    if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.detail || "HTTP " + r.status); }
+    row.innerHTML = '<span class="pill ok">enrolled</span> <span class="grow">saved as <b>' + escapeHtml(name) + "</b></span>";
+    loadLibrary();
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = "Save"; }
+    const err = document.createElement("span"); err.className = "pill bad"; err.textContent = e.message;
+    row.appendChild(err); setTimeout(() => err.remove(), 3000);
+  }
+}
+
+// Per-speaker enroll list under a diarized transcript. Reads speakers[].embedding from the result.
+function renderSpeakerPanel(data) {
+  const panel = $("#speakerPanel"), list = $("#speakerList");
+  const speakers = data.speakers || [];
+  if (!speakers.length || $("#libraryCard").classList.contains("hidden")) {
+    panel.classList.add("hidden"); list.innerHTML = ""; return;
+  }
+  const order = speakerOrder(data.segments || []);  // first-appearance order → matches transcript colours
+  list.innerHTML = "";
+  speakers.forEach((s) => {
+    const i = Math.max(0, order.indexOf(s.id));
+    const chip = '<span class="spk" style="' + spkStyle(i) + '">Speaker ' + (i + 1) + "</span>";
+    const talk = '<span class="muted" style="font:10px var(--mono)">' + fmt(s.talk_time || 0) + "</span>";
+    const row = document.createElement("div"); row.className = "spkrow";
+    if (!s.embedding) {
+      row.innerHTML = chip + '<span class="grow muted">no voiceprint (too little speech to enroll)</span>' + talk;
+    } else if (s.name) {
+      row.innerHTML = chip + '<span class="grow">recognized as <b>' + escapeHtml(s.name) + "</b>"
+        + (s.match_score != null ? ' <span class="pill ok">' + s.match_score.toFixed(2) + "</span>" : "") + "</span>" + talk;
+    } else {
+      row.innerHTML = chip + '<input type="text" class="nm grow" placeholder="name this speaker to enroll…" />'
+        + '<button class="btn">Save</button>' + talk;
+      const input = row.querySelector("input");
+      const save = () => enrollSpeaker(input.value, s.embedding, row);
+      row.querySelector("button").onclick = save;
+      input.addEventListener("keydown", (e) => { if (e.key === "Enter") save(); });
+    }
+    list.appendChild(row);
+  });
+  panel.classList.remove("hidden");
+}
+
+function nameMap(data) {
+  const m = {};
+  for (const s of (data.speakers || [])) if (s.name) m[s.id] = { name: s.name, score: s.match_score };
+  return m;
+}
+function speakerOrder(segs) {
+  const o = []; for (const s of segs) { const r = s.speaker; if (r && o.indexOf(r) < 0) o.push(r); } return o;
 }
 
 // ── select audio (recording or file) ──
@@ -242,10 +366,13 @@ $("#goBtn").onclick = async () => {
   const status = $("#statusPill"); status.className = "pill warn";
   status.innerHTML = '<span class="spinner"></span> transcribing…';
   $("#transcript").innerHTML = ""; $("#meta").innerHTML = "";
+  $("#speakerPanel").classList.add("hidden");
   $("#goBtn").disabled = true;
   const fd = new FormData();
   fd.append("file", state.blob, state.name);
-  fd.append("diarize", $("#diarize").checked ? "true" : "false");
+  const idOn = $("#identify").checked;
+  fd.append("diarize", ($("#diarize").checked || idOn) ? "true" : "false");
+  fd.append("identify", idOn ? "true" : "false");
   const t0 = performance.now();
   try {
     const r = await fetch("/v1/audio/transcriptions", { method: "POST", body: fd });
@@ -284,6 +411,7 @@ function render(data) {
   $("#meta").innerHTML = chips.join("");
 
   const out = $("#transcript");
+  const names = nameMap(data);
   if (diarized) {
     // map raw speaker ids → Speaker 1..N in first-appearance order; group consecutive segments
     const order = [], turns = [];
@@ -295,11 +423,14 @@ function render(data) {
       if (last && last.idx === idx) { last.end = s.end; last.text += " " + (s.text || "").trim(); }
       else turns.push({ idx, raw, start: s.start, end: s.end, text: (s.text || "").trim() });
     }
-    out.innerHTML = turns.map((t) =>
-      '<div class="turn"><span class="spk" style="' + spkStyle(t.idx) + '">Speaker ' + (t.idx + 1) + '</span>'
-      + '<span class="ts show-ts">' + fmt(t.start) + "–" + fmt(t.end) + "</span>"
-      + '<div class="txt" style="margin-top:4px">' + escapeHtml(t.text) + "</div></div>"
-    ).join("");
+    out.innerHTML = turns.map((t) => {
+      const nm = names[t.raw];
+      const label = nm ? escapeHtml(nm.name) : ("Speaker " + (t.idx + 1));
+      const score = (nm && nm.score != null) ? ' <span class="pill ok" title="recognition score">' + nm.score.toFixed(2) + "</span>" : "";
+      return '<div class="turn"><span class="spk" style="' + spkStyle(t.idx) + '">' + label + "</span>" + score
+        + '<span class="ts show-ts">' + fmt(t.start) + "–" + fmt(t.end) + "</span>"
+        + '<div class="txt" style="margin-top:4px">' + escapeHtml(t.text) + "</div></div>";
+    }).join("");
   } else if (segs.length) {
     out.innerHTML = segs.map((s) =>
       '<div class="turn"><span class="ts show-ts">' + fmt(s.start) + "</span> "
@@ -308,6 +439,7 @@ function render(data) {
   } else {
     out.innerHTML = '<div class="plain">' + escapeHtml(data.text || "(no speech detected)") + "</div>";
   }
+  renderSpeakerPanel(data);
   applyTs();
   // exports
   const txt = plainText(data, diarized), md = markdown(data, diarized);
@@ -328,10 +460,11 @@ function applyTs() {
 function plainText(data, diarized) {
   const segs = data.segments || [];
   if (diarized) {
-    const order = [], lines = [];
+    const order = [], names = nameMap(data), lines = [];
     for (const s of segs) {
       const raw = s.speaker || "?"; if (order.indexOf(raw) < 0) order.push(raw);
-      lines.push("Speaker " + (order.indexOf(raw) + 1) + ": " + (s.text || "").trim());
+      const label = names[raw] ? names[raw].name : ("Speaker " + (order.indexOf(raw) + 1));
+      lines.push(label + ": " + (s.text || "").trim());
     }
     return lines.join("\n");
   }
@@ -342,10 +475,11 @@ function markdown(data, diarized) {
   let md = "# Meeting transcript\n\n_" + d.toISOString().slice(0, 16).replace("T", " ") + " · " + (data.language || "") + " · " + fmt(data.duration || 0) + "_\n\n";
   const segs = data.segments || [];
   if (diarized) {
-    const order = [];
+    const order = [], names = nameMap(data);
     for (const s of segs) {
       const raw = s.speaker || "?"; if (order.indexOf(raw) < 0) order.push(raw);
-      md += "**Speaker " + (order.indexOf(raw) + 1) + "** (" + fmt(s.start) + "): " + (s.text || "").trim() + "\n\n";
+      const label = names[raw] ? names[raw].name : ("Speaker " + (order.indexOf(raw) + 1));
+      md += "**" + label + "** (" + fmt(s.start) + "): " + (s.text || "").trim() + "\n\n";
     }
   } else {
     md += (data.text || "").trim() + "\n";

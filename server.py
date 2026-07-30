@@ -22,6 +22,12 @@ ignored by clients that don't know them, so the contract stays backward compatib
 failures degrade gracefully: the transcription is returned with a ``diarization_error`` instead of
 a 500. Requires ``HF_TOKEN`` (gated model) — read from the environment or ``.env`` next to this file.
 
+Optional **speaker recognition** (``speakers.py`` — stdlib SQLite, no extra model): enroll named
+voiceprints (``POST /v1/speakers`` from a vector, or ``/v1/speakers/from-audio`` from a sample) and
+pass ``identify=true`` so a recording's diarized speakers are matched to them by cosine similarity —
+each ``speakers`` entry then also carries ``name`` + ``match_score``. ``identify=true`` implies
+diarization; the library persists to ``SPEAKER_DB``.
+
 Reliability on large recordings:
   * the blocking transcription runs in a worker thread (``asyncio.to_thread``), so the event loop
     — and ``/health`` — stays responsive for the whole multi-minute job instead of hanging;
@@ -41,6 +47,8 @@ import contextlib
 import importlib.util
 import math
 import os
+import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -53,6 +61,9 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
+
+from speakers import SpeakerLibrary, SpeakerError
 
 BACKEND = os.environ.get("WHISPER_BACKEND", "auto").strip().lower()
 MODEL = os.environ.get("WHISPER_MODEL", "").strip()  # empty → per-backend default below
@@ -82,6 +93,16 @@ HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"
 # which a Python try/except can't catch. Set WHISPER_ALLOW_DIARIZE=0 there so a diarize=true request
 # is ignored (returns a normal transcript) instead of crashing the process.
 DIARIZE_ENABLED = os.environ.get("WHISPER_ALLOW_DIARIZE", "1").strip().lower() in ("1", "true", "yes", "on")
+
+# Speaker recognition: a persistent SQLite library of named voiceprints (speakers.py). Enrolled
+# speakers are matched against a recording's diarized voiceprints by cosine similarity, so the same
+# person is recognized across recordings. The store itself needs no model (enroll from a vector);
+# identify + enroll-from-audio require diarization. SPEAKER_LIBRARY=0 disables the feature entirely
+# (endpoints 404, identify ignored) for a locked-down / read-only deployment.
+SPEAKER_LIBRARY_ENABLED = os.environ.get("SPEAKER_LIBRARY", "1").strip().lower() in ("1", "true", "yes", "on")
+SPEAKER_DB = os.environ.get("SPEAKER_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "speakers.db"))
+SPEAKER_IDENTIFY_DEFAULT = os.environ.get("SPEAKER_IDENTIFY", "0").strip().lower() in ("1", "true", "yes", "on")
+SPEAKER_THRESHOLD = float(os.environ.get("SPEAKER_IDENTIFY_THRESHOLD", "0.5"))
 
 
 def _resolve_backend_name() -> str:
@@ -202,7 +223,7 @@ async def _lifespan(_app):
     yield
 
 
-app = FastAPI(title="SecRecorder", version="0.6.1", lifespan=_lifespan)
+app = FastAPI(title="SecRecorder", version="0.7.0", lifespan=_lifespan)
 
 # Built-in web UI (record / upload -> transcribe), served same-origin as the API.
 # Read once at startup from ui.html next to this file; optional (API works without it).
@@ -262,6 +283,26 @@ def _load_diarizer():
         return _diarizer
 
 
+_library = None  # lazy-opened speaker library (SQLite); no model load
+_library_lock = threading.Lock()
+
+
+def _get_library() -> SpeakerLibrary:
+    """Open the speaker library (SQLite at SPEAKER_DB) once, thread-safe. Cheap — no model load."""
+    global _library
+    with _library_lock:
+        if _library is None:
+            _library = SpeakerLibrary(SPEAKER_DB)
+        return _library
+
+
+def _require_library() -> SpeakerLibrary:
+    """The library, or a 404 when the feature is disabled for this host (SPEAKER_LIBRARY=0)."""
+    if not SPEAKER_LIBRARY_ENABLED:
+        raise HTTPException(status_code=404, detail="speaker library is disabled on this host")
+    return _get_library()
+
+
 def _json_safe(obj, path: str = "", found: list | None = None):
     """Replace non-finite floats (NaN / ±inf) with None, recursively.
 
@@ -306,12 +347,46 @@ def _speaker_embeddings(out) -> dict[str, list[float]]:
     return emb
 
 
+_FFMPEG = shutil.which("ffmpeg")
+
+
+def _to_wav16k(path: str):
+    """Transcode any input to 16 kHz mono PCM WAV via ffmpeg. pyannote decodes a file in chunks and
+    its strict crop raises on compressed input — AAC/m4a encoder priming makes a chunk come back a
+    few samples short ("…477888 samples instead of the expected 480000"). PCM WAV has exact sample
+    counts, so diarization is format-agnostic. Returns the new path, or None if ffmpeg is absent
+    (the caller then falls back to the original file)."""
+    if not _FFMPEG:
+        return None
+    out = tempfile.NamedTemporaryFile(suffix=".dia.wav", delete=False).name
+    try:
+        subprocess.run([_FFMPEG, "-nostdin", "-y", "-i", path, "-ac", "1", "-ar", "16000",
+                        "-c:a", "pcm_s16le", "-f", "wav", out], check=True, capture_output=True)
+        return out
+    except Exception:  # noqa: BLE001 — fall back to the raw upload path
+        try:
+            os.unlink(out)
+        except OSError:
+            pass
+        return None
+
+
 def _diarize(path: str) -> tuple[list[tuple[float, float, str]], dict[str, list[float]]]:
     """Run diarization → (sorted ``[(start_s, end_s, label)]`` turns, ``{label: embedding}``).
+    The upload is first transcoded to 16 kHz mono PCM WAV (``_to_wav16k``) so pyannote's per-chunk
+    cropping doesn't choke on compressed formats (m4a/AAC).
     pyannote 4.x returns a ``DiarizeOutput`` — use its ``exclusive_speaker_diarization``
     (non-overlapping turns, made for transcription alignment); older pipelines return the
     ``Annotation`` directly (and carry no embeddings)."""
-    out = _load_diarizer()(path)
+    wav = _to_wav16k(path)
+    try:
+        out = _load_diarizer()(wav or path)
+    finally:
+        if wav:
+            try:
+                os.unlink(wav)
+            except OSError:
+                pass
     annotation = (getattr(out, "exclusive_speaker_diarization", None)
                   or getattr(out, "speaker_diarization", None) or out)
     turns = [(float(seg.start), float(seg.end), str(label))
@@ -377,7 +452,12 @@ def health() -> dict:
             "diarizer_loaded": _diarizer is not None,
             "loaded": _backend is not None,
             **({"device": _backend.device} if _backend is not None else {}),
-            **({"diarizer_device": _diarizer_device} if _diarizer is not None else {})}
+            **({"diarizer_device": _diarizer_device} if _diarizer is not None else {}),
+            "ffmpeg": _FFMPEG is not None,
+            "speaker_library_enabled": SPEAKER_LIBRARY_ENABLED,
+            "identify_default": SPEAKER_IDENTIFY_DEFAULT,
+            "identify_threshold": SPEAKER_THRESHOLD,
+            **({"speaker_count": _library.count()} if _library is not None else {})}
 
 
 # --- OpenAI-compatible Models API -------------------------------------------------
@@ -408,6 +488,101 @@ def retrieve_model(model_id: str):
         "type": "invalid_request_error", "param": "model", "code": "model_not_found"}})
 
 
+# --- Speaker library: enroll named voiceprints, recognize them across recordings ---------------
+# A voiceprint is a `speakers[].embedding` from a diarized transcription. Enroll one under a name,
+# then pass identify=true on a later transcription to have its speakers matched back to that name.
+
+
+class EnrollBody(BaseModel):
+    name: str
+    embedding: list[float]
+    source: str | None = None
+    meta: dict | None = None
+
+
+class SampleBody(BaseModel):
+    embedding: list[float]
+    source: str | None = None
+
+
+@app.get("/v1/speakers")
+def speakers_list() -> dict:
+    """List enrolled speakers (id, name, sample count, timestamps) — newest-updated first."""
+    return {"object": "list", "data": _require_library().list_speakers()}
+
+
+@app.post("/v1/speakers", status_code=201)
+def speakers_enroll(body: EnrollBody) -> dict:
+    """Enroll a speaker from a voiceprint vector — e.g. a ``speakers[].embedding`` returned by a
+    prior transcription. To enroll straight from an audio sample use ``/v1/speakers/from-audio``."""
+    try:
+        return _require_library().enroll(body.name, body.embedding, source=body.source, meta=body.meta)
+    except SpeakerError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.get("/v1/speakers/{speaker_id}")
+def speakers_get(speaker_id: str, centroid: bool = False) -> dict:
+    """One speaker. ``?centroid=1`` includes its mean voiceprint."""
+    spk = _require_library().get(speaker_id, with_centroid=centroid)
+    if spk is None:
+        raise HTTPException(status_code=404, detail=f"unknown speaker: {speaker_id}")
+    return spk
+
+
+@app.post("/v1/speakers/{speaker_id}/samples", status_code=201)
+def speakers_add_sample(speaker_id: str, body: SampleBody) -> dict:
+    """Add another voiceprint to an existing speaker — more samples sharpen recognition."""
+    try:
+        return _require_library().add_sample(speaker_id, body.embedding, source=body.source)
+    except SpeakerError as e:
+        code = 404 if "unknown speaker" in str(e) else 400
+        raise HTTPException(status_code=code, detail=str(e)) from e
+
+
+@app.delete("/v1/speakers/{speaker_id}")
+def speakers_delete(speaker_id: str) -> dict:
+    """Remove a speaker and all its voiceprints."""
+    if not _require_library().delete(speaker_id):
+        raise HTTPException(status_code=404, detail=f"unknown speaker: {speaker_id}")
+    return {"deleted": speaker_id}
+
+
+@app.post("/v1/speakers/from-audio", status_code=201)
+async def speakers_enroll_audio(file: UploadFile = File(...), name: str = Form(...)) -> dict:
+    """Enroll a speaker from an audio sample: diarize it, take the dominant speaker's voiceprint,
+    and store it under ``name``. Use a clean, single-speaker sample. Requires diarization."""
+    lib = _require_library()
+    if not DIARIZE_ENABLED:
+        raise HTTPException(status_code=503, detail="diarization disabled; enroll from a vector instead")
+    path, size = await _spool_upload(file)
+    if size == 0:
+        os.unlink(path)
+        raise HTTPException(status_code=400, detail="empty file")
+    try:
+        async with _dia_sem:
+            turns, emb, err = await asyncio.to_thread(_diarize_safe, path)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    if err:
+        raise HTTPException(status_code=422, detail=f"diarization failed: {err}")
+    if not emb:
+        raise HTTPException(status_code=422, detail="no usable voiceprint in the sample")
+    # Dominant speaker = most talk time among labels that produced a usable voiceprint.
+    talk: dict[str, float] = {}
+    for ts, te, label in turns:
+        talk[label] = talk.get(label, 0.0) + (te - ts)
+    dominant = max(emb, key=lambda lbl: talk.get(lbl, 0.0))
+    try:
+        spk = lib.enroll(name, emb[dominant], source=f"audio:{os.path.basename(file.filename or 'sample')}")
+    except SpeakerError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {**spk, "speakers_in_sample": len(talk)}
+
+
 async def _spool_upload(file: UploadFile) -> tuple[str, int]:
     """Stream the multipart upload to a temp ``.wav`` in 1 MiB chunks (bounded memory — never
     holds the whole recording in RAM). Returns (path, size_bytes). Enforces
@@ -431,7 +606,8 @@ async def _spool_upload(file: UploadFile) -> tuple[str, int]:
 
 @app.post("/v1/audio/transcriptions")
 async def transcriptions(file: UploadFile = File(...),
-                         diarize: str | None = Form(None)) -> JSONResponse:
+                         diarize: str | None = Form(None),
+                         identify: str | None = Form(None)) -> JSONResponse:
     """OpenAI-compatible transcription. The ``model`` / ``response_format`` /
     ``timestamp_granularities[]`` form fields the client sends are accepted and ignored — this
     server always uses the loaded model and always returns verbose_json + word[].
@@ -439,9 +615,13 @@ async def transcriptions(file: UploadFile = File(...),
     global _inflight
     requested_diarize = (DIARIZE_DEFAULT if diarize is None
                          else diarize.strip().lower() in ("1", "true", "yes", "on"))
+    requested_identify = (SPEAKER_IDENTIFY_DEFAULT if identify is None
+                          else identify.strip().lower() in ("1", "true", "yes", "on"))
+    want_identify = requested_identify and SPEAKER_LIBRARY_ENABLED
     # Honour the hard kill-switch: if diarization is disabled for this host, ignore the request
     # (return a plain transcript) rather than attempt a load that could natively abort.
-    want_diarize = requested_diarize and DIARIZE_ENABLED
+    # Identification needs the per-speaker voiceprints, so asking to identify turns diarization on.
+    want_diarize = (requested_diarize or want_identify) and DIARIZE_ENABLED
     path, size = await _spool_upload(file)
     if size == 0:
         os.unlink(path)
@@ -502,14 +682,28 @@ async def transcriptions(file: UploadFile = File(...),
                                 **({"embedding": dia_emb[s]} if s in dia_emb else {})}
                                for s, t in sorted(talk.items())]
         n_speakers = len(talk)
+        if want_identify and dia_emb:
+            # Match each diarized voiceprint to an enrolled speaker. Off the loop (cheap, but a
+            # large library shouldn't stall it). Annotate the summary; labels stay stable.
+            matches = await asyncio.to_thread(_get_library().identify_many, dia_emb, SPEAKER_THRESHOLD)
+            for sp in payload["speakers"]:
+                mt = matches.get(sp["id"])
+                if mt:
+                    sp["name"] = mt["name"]
+                    sp["speaker_id"] = mt["speaker_id"]
+                    sp["match_score"] = mt["score"]
     elif want_diarize and dia_err:
         payload["diarization_error"] = dia_err
     elif requested_diarize and not DIARIZE_ENABLED:
         payload["diarization_disabled"] = True  # asked for, but disabled on this host
+    if requested_identify and not SPEAKER_LIBRARY_ENABLED:
+        payload["identification_disabled"] = True  # asked for, but the library is disabled here
 
     dur = payload["duration"]
     rtf = f"{dur / elapsed:.0f}x realtime" if elapsed > 0 else "n/a"
-    dia_note = (f", {n_speakers} speakers" if n_speakers
+    n_named = sum(1 for sp in payload.get("speakers", []) if sp.get("name"))
+    dia_note = ((f", {n_speakers} speakers" + (f" ({n_named} named)" if n_named else ""))
+                if n_speakers
                 else (f", diarize FAILED: {dia_err}" if dia_err else ""))
     # Scrub non-finite floats LAST, so nothing above has to care. One NaN would otherwise 500 the
     # whole request (Starlette serializes with allow_nan=False) and lose the episode.

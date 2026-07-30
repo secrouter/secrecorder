@@ -1,11 +1,13 @@
 [project]
 name = "speakerbox"
-version = "0.6.1"
-description = "Multi-backend Whisper server (Apple MLX / faster-whisper CUDA) with an OpenAI-compatible API + diarization"
+version = "0.7.0"
+description = "Multi-backend Whisper server (Apple MLX / faster-whisper CUDA) with an OpenAI-compatible API + diarization + speaker recognition"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
+    # Also requires the system binary `ffmpeg` on PATH (audio decode for the MLX backend +
+    # the diarizer's WAV normalisation) — not a Python package; see README Requirements.
     "fastapi",
     "uvicorn[standard]",
     "python-multipart",

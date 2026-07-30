@@ -10,6 +10,11 @@ __pycache__/
 # runtime logs
 *.log
 
+# speaker library (enrolled voiceprints — machine-local, may hold biometric data)
+*.db
+*.db-wal
+*.db-shm
+
 # test audio + benchmark data (large / machine-specific) — but keep the .md result docs
 *.wav
 *.aiff

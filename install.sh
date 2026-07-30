@@ -4,13 +4,57 @@
 # SecRecorder (aka SpeakerBox) installer.
 #
 #   ./install.sh [SECRETS_FILE]   set up the venv; if given, write SECRETS_FILE -> .env (chmod 600)
+#   ./install.sh --with-ffmpeg    also install the ffmpeg system binary if it is missing
 #   ./install.sh --service        print a ready-to-use service unit for this platform, then exit
 #
+# Flags combine with SECRETS_FILE, e.g.  ./install.sh --with-ffmpeg secrets.env
 # SECRETS_FILE is a KEY=VALUE env file (see secrets.env.example). Only HF_TOKEN is used today, and
 # only for speaker diarization — transcription needs no secrets, so the argument is optional.
 set -euo pipefail
 cd "$(dirname "$0")"
 HERE="$(pwd)"
+
+# ---- args -------------------------------------------------------------------------------------
+SERVICE=0; WITH_FFMPEG=0; SECRETS=""
+for arg in "$@"; do
+  case "$arg" in
+    --service)                      SERVICE=1 ;;
+    --with-ffmpeg|--install-ffmpeg) WITH_FFMPEG=1 ;;
+    --*) echo "error: unknown option: $arg" >&2; exit 1 ;;
+    *)   SECRETS="$arg" ;;
+  esac
+done
+
+# ---- ffmpeg installer (used below when --with-ffmpeg is set and ffmpeg is missing) ------------
+install_ffmpeg() {
+  echo "==> installing ffmpeg…"
+  case "$(uname -s)" in
+    Darwin)
+      command -v brew >/dev/null 2>&1 || {
+        echo "error: Homebrew not found — install it from https://brew.sh, then: brew install ffmpeg" >&2
+        return 1; }
+      brew install ffmpeg ;;
+    Linux)
+      local SUDO=""
+      if [ "$(id -u)" -ne 0 ]; then
+        command -v sudo >/dev/null 2>&1 && SUDO="sudo" || {
+          echo "error: installing ffmpeg needs root — re-run as root or install sudo." >&2; return 1; }
+      fi
+      if   command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update && $SUDO apt-get install -y ffmpeg
+      elif command -v dnf     >/dev/null 2>&1; then $SUDO dnf install -y ffmpeg
+      elif command -v yum     >/dev/null 2>&1; then $SUDO yum install -y ffmpeg
+      elif command -v pacman  >/dev/null 2>&1; then $SUDO pacman -Sy --noconfirm ffmpeg
+      elif command -v zypper  >/dev/null 2>&1; then $SUDO zypper install -y ffmpeg
+      elif command -v apk     >/dev/null 2>&1; then $SUDO apk add ffmpeg
+      else
+        echo "error: no supported package manager (apt/dnf/yum/pacman/zypper/apk) — install ffmpeg manually." >&2
+        return 1
+      fi ;;
+    *) echo "error: automatic ffmpeg install unsupported on $(uname -s) — install it manually." >&2; return 1 ;;
+  esac
+  hash -r 2>/dev/null || true            # refresh the shell's command lookup
+  command -v ffmpeg >/dev/null 2>&1      # succeeds iff ffmpeg is now on PATH
+}
 
 # ---- uv ---------------------------------------------------------------------------------------
 UV="$(command -v uv || true)"
@@ -22,7 +66,7 @@ if [ -z "$UV" ]; then
 fi
 
 # ---- --service: emit a persistence unit and exit ----------------------------------------------
-if [ "${1:-}" = "--service" ]; then
+if [ "$SERVICE" = "1" ]; then
   case "$(uname -s)" in
     Darwin)
       cat <<PLIST
@@ -78,8 +122,28 @@ fi
 echo "==> installing dependencies with uv (backend auto-selected for this platform)…"
 "$UV" sync
 
+# ---- ffmpeg (system binary, not a Python package) ---------------------------------------------
+# Audio decode for the MLX backend + the diarizer's WAV normalisation (all backends). Must be on PATH.
+if command -v ffmpeg >/dev/null 2>&1; then
+  echo "==> ffmpeg: $(command -v ffmpeg)"
+elif [ "$WITH_FFMPEG" = "1" ]; then
+  if install_ffmpeg; then
+    echo "==> ffmpeg installed: $(command -v ffmpeg)"
+  else
+    echo "==> ERROR: could not install ffmpeg automatically (see messages above)." >&2
+    exit 1
+  fi
+else
+  echo "==> WARNING: 'ffmpeg' not found on PATH — required for the MLX backend and for speaker" >&2
+  echo "             diarization/recognition. Re-run with --with-ffmpeg to install it, or:" >&2
+  case "$(uname -s)" in
+    Darwin) echo "               brew install ffmpeg" >&2 ;;
+    Linux)  echo "               sudo apt-get install -y ffmpeg" >&2 ;;
+    *)      echo "               install ffmpeg via your package manager." >&2 ;;
+  esac
+fi
+
 # ---- secrets ----------------------------------------------------------------------------------
-SECRETS="${1:-}"
 if [ -n "$SECRETS" ]; then
   [ -f "$SECRETS" ] || { echo "error: secrets file not found: $SECRETS" >&2; exit 1; }
   umask 077
