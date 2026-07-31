@@ -479,8 +479,24 @@ async function liveTick() {
 }
 
 function normw(w) { return (w || "").trim().toLowerCase().replace(/^[.,!?;:"'—-]+|[.,!?;:"'—-]+$/g, ""); }
+// Whisper can occasionally repeat an adjacent word/short-phrase verbatim within a single short
+// window's hypothesis (a known decoder loop artifact); its own compression-ratio/temperature-
+// fallback guards are tuned for egregious repetition, not one mild duplicate, and LocalAgreement
+// compares hypotheses positionally, so an uncollapsed dupe can visibly flash in the volatile
+// preview even though it self-corrects out of the committed text a tick or two later. Collapsing
+// adjacent dupes before comparison removes that flash; the accurate post-Stop pass doesn't go
+// through this path, so a genuine doubled word ("the the") is never lost from the final
+// transcript, only possibly from the live preview for a moment.
+function dedupAdjacent(words) {
+  const out = [];
+  for (const w of words) {
+    if (out.length && normw(out[out.length - 1][2]) === normw(w[2])) continue;
+    out.push(w);
+  }
+  return out;
+}
 function commitLocalAgreement(newAbs) {
-  const nw = newAbs.filter((x) => x[1] > live.lastTime - 0.1);   // ignore already-committed region
+  const nw = dedupAdjacent(newAbs).filter((x) => x[1] > live.lastTime - 0.1);   // ignore already-committed region
   const prev = live.prevHyp;
   let i = 0;
   while (i < nw.length && i < prev.length && normw(nw[i][2]) === normw(prev[i][2])) {

@@ -135,8 +135,11 @@ class MlxBackend:
 
     def transcribe(self, path: str, initial_prompt: str | None = None) -> dict:
         import mlx_whisper
+        # condition_on_previous_text=False: the default lets an uncertain/garbled segment bias
+        # every later segment in the same call, which is how Whisper gets stuck repeating a
+        # word or phrase — most visible on live's short, rapidly re-transcribed windows.
         return mlx_whisper.transcribe(path, path_or_hf_repo=self.model_id, word_timestamps=True,
-                                      initial_prompt=initial_prompt)
+                                      initial_prompt=initial_prompt, condition_on_previous_text=False)
 
     def clear_cache(self) -> None:
         for fn in (getattr(self._mx, "clear_cache", None),
@@ -160,7 +163,9 @@ class FasterWhisperBackend:
         self._model = WhisperModel(model_id, device=device, compute_type=compute_type)
 
     def transcribe(self, path: str, initial_prompt: str | None = None) -> dict:
-        segments, info = self._model.transcribe(path, word_timestamps=True, initial_prompt=initial_prompt)
+        # condition_on_previous_text=False: see MlxBackend.transcribe — same repetition-loop risk.
+        segments, info = self._model.transcribe(path, word_timestamps=True, initial_prompt=initial_prompt,
+                                                 condition_on_previous_text=False)
         out = []
         for s in segments:  # generator — consuming it runs the transcription
             out.append({

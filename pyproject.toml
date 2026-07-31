@@ -1,6 +1,6 @@
 [project]
 name = "speakerbox"
-version = "0.8.0"
+version = "0.8.1"
 description = "Multi-backend Whisper server (Apple MLX / faster-whisper CUDA) with an OpenAI-compatible API + diarization + speaker recognition"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
