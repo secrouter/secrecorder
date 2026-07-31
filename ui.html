@@ -459,6 +459,14 @@ async function liveTick() {
   if (live.samples.length > maxSamp) {   // agreement stalled — force the window to stay bounded
     const drop = live.samples.length - maxSamp;
     live.samples.splice(0, drop); live.base += drop / LIVE_RATE;
+    // prevHyp was computed for the window BEFORE this drop — it no longer corresponds to
+    // anything still buffered. Comparing it against the next (now differently-windowed)
+    // hypothesis can spuriously "agree" on words that only match by coincidence, permanently
+    // committing stale/duplicate text (this is what caused visible word/phrase repeats during
+    // long stalled-agreement stretches, e.g. background noise or cross-talk). Judge the next
+    // hypothesis fresh instead.
+    live.prevHyp = [];
+    live.lastTime = Math.max(live.lastTime, live.base);
   }
   if (live.samples.length < LIVE_RATE * 0.6) return;   // wait for >= 0.6s of new audio
   live.busy = true;
