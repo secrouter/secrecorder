@@ -17,5 +17,9 @@ cd "$(dirname "$0")"
 export WHISPER_PREWARM="${WHISPER_PREWARM:-1}"
 export WHISPER_PREWARM_DIARIZER="${WHISPER_PREWARM_DIARIZER:-1}"
 HOST="${HOST:-127.0.0.1}"; PORT="${PORT:-9000}"
-echo "SecRecorder -> http://${HOST}:${PORT}   (model: ${WHISPER_MODEL:-auto per backend}, prewarm: ${WHISPER_PREWARM})"
-exec uv run uvicorn server:app --host "$HOST" --port "$PORT"
+# On an NVIDIA/CUDA box, sync + run with the `cuda` extra so uv installs cuBLAS/cuDNN and does NOT
+# prune them on its pre-run sync (CTranslate2 needs them at load). CPU/Apple boxes skip it.
+UV_EXTRA=""
+if [ "$(uname -s)" = "Linux" ] && command -v nvidia-smi >/dev/null 2>&1; then UV_EXTRA="--extra cuda"; fi
+echo "SecRecorder -> http://${HOST}:${PORT}   (model: ${WHISPER_MODEL:-auto per backend}, prewarm: ${WHISPER_PREWARM}${UV_EXTRA:+, cuda: on})"
+exec uv run $UV_EXTRA uvicorn server:app --host "$HOST" --port "$PORT"

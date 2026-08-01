@@ -41,8 +41,8 @@ across recordings.
   WAV (all backends). Install it yourself (`brew install ffmpeg` / `apt-get install ffmpeg`), or let
   the installer handle it: `./install.sh --with-ffmpeg`.
 - **NVIDIA GPU (faster-whisper backend):** CTranslate2 needs **cuBLAS + cuDNN 9** at runtime and does
-  not bundle them. If your box lacks the system CUDA libraries, install them into the venv with
-  `./install.sh --with-cuda` (or `uv sync --extra cuda`).
+  not bundle them. `./run.sh` auto-installs them (the `cuda` extra) when it detects an NVIDIA GPU; to
+  pre-install at setup use `./install.sh --with-cuda` (or `uv sync --extra cuda`).
 - For diarization only: a Hugging Face token whose account has accepted the
   [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1)
   conditions. Transcription needs no token.
