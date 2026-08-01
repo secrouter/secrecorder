@@ -2,7 +2,7 @@
 # Copyright 2026 Austin Probe
 # SPDX-License-Identifier: Apache-2.0
 # Start the Whisper server in the foreground.
-#   ./run.sh                                  # 127.0.0.1:9000 (model: MLX turbo on Apple, large-v3 on faster-whisper)
+#   ./run.sh                                  # 127.0.0.1:9000 (model: large-v3-turbo — MLX build on Apple, CTranslate2 build on faster-whisper)
 #   PORT=9001 ./run.sh                        # override port
 #   HOST=0.0.0.0 ./run.sh                     # expose on LAN/VPN (worker on another box)
 #   WHISPER_MODEL=large-v3 ./run.sh           # pin a model (CTranslate2 id for faster-whisper, mlx-community/* for MLX)

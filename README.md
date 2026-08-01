@@ -79,7 +79,7 @@ client.audio.transcriptions.create(model="whisper-1", file=open("audio.wav", "rb
 | Variable | Default | Meaning |
 |---|---|---|
 | `WHISPER_BACKEND` | `auto` | `mlx` \| `faster-whisper` \| `auto` (mlx if importable, else faster-whisper) |
-| `WHISPER_MODEL` | per-backend | mlx: `mlx-community/whisper-large-v3-turbo` · faster-whisper: `large-v3` |
+| `WHISPER_MODEL` | per-backend | mlx: `mlx-community/whisper-large-v3-turbo` · faster-whisper: `deepdml/faster-whisper-large-v3-turbo-ct2` |
 | `WHISPER_DEVICE` | `auto` | faster-whisper only: `cuda` \| `cpu` \| `auto` |
 | `WHISPER_COMPUTE_TYPE` | auto | faster-whisper only: `float16` (cuda) \| `int8` (cpu) \| … |
 | `WHISPER_MAX_CONCURRENCY` | `1` | concurrent transcriptions (GPU-serialized) |

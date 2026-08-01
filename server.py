@@ -114,7 +114,11 @@ def _resolve_backend_name() -> str:
 
 
 BACKEND_NAME = _resolve_backend_name()
-_DEFAULT_MODEL = {"mlx": "mlx-community/whisper-large-v3-turbo"}.get(BACKEND_NAME, "large-v3")
+# Per-backend default — both large-v3-turbo: the MLX build on Apple, a CTranslate2 turbo build on
+# faster-whisper (CUDA/CPU). Pinned to the exact CT2 repo (not the version-specific alias). Override
+# either with WHISPER_MODEL.
+_DEFAULT_MODEL = {"mlx": "mlx-community/whisper-large-v3-turbo"}.get(
+    BACKEND_NAME, "deepdml/faster-whisper-large-v3-turbo-ct2")
 MODEL_ID = MODEL or _DEFAULT_MODEL  # display id; the heavy model load stays lazy in the backend
 
 
