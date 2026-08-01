@@ -40,6 +40,9 @@ across recordings.
 - **`ffmpeg`** on `PATH` — decodes audio for the MLX backend and normalises the diarizer's input to
   WAV (all backends). Install it yourself (`brew install ffmpeg` / `apt-get install ffmpeg`), or let
   the installer handle it: `./install.sh --with-ffmpeg`.
+- **NVIDIA GPU (faster-whisper backend):** CTranslate2 needs **cuBLAS + cuDNN 9** at runtime and does
+  not bundle them. If your box lacks the system CUDA libraries, install them into the venv with
+  `./install.sh --with-cuda` (or `uv sync --extra cuda`).
 - For diarization only: a Hugging Face token whose account has accepted the
   [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1)
   conditions. Transcription needs no token.
@@ -108,7 +111,9 @@ client.audio.transcriptions.create(model="whisper-1", file=open("audio.wav", "rb
 the `platform_system == 'Linux'` dependency marker. faster-whisper transcription decodes audio via
 bundled PyAV, but **speaker diarization still needs system `ffmpeg`** (the input is normalised to WAV
 first — see Requirements). CUDA needs a working driver and a GPU new enough for the current
-PyTorch/CTranslate2 build.
+PyTorch/CTranslate2 build, plus **cuBLAS + cuDNN 9** for CTranslate2 — run `./install.sh --with-cuda`
+(or `uv sync --extra cuda`) if they aren't already on the system, or you'll see a CTranslate2 load
+error at first transcription.
 
 ## Running as a background service
 
