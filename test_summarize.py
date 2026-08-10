@@ -124,6 +124,38 @@ def test_error_on_empty_summary():
         pass
 
 
+def test_no_classification_header_by_default():
+    # Neither the env default nor a per-call level ⇒ the header is omitted entirely (SecRouter
+    # falls back to its configured default — the pre-existing behavior).
+    _install_fake()
+    summarize._summarize_sync("text", "alice")
+    check("x-data-classification" not in _captured["headers"],
+          f"no classification configured, header must be absent: {_captured['headers']}")
+
+
+def test_classification_per_call_override():
+    # A caller with per-recording markings (e.g. SecChat Meetings) passes the level per call; it
+    # rides x-data-classification so SecRouter's clearance/egress gate evaluates at that level.
+    _install_fake()
+    summarize._summarize_sync("text", "alice", "CUI")
+    check(_captured["headers"].get("x-data-classification") == "CUI",
+          f"per-call classification should ride the header: {_captured['headers']}")
+
+
+def test_classification_env_default():
+    # The deployment-level default (SECRECORDER_SUMMARIZE_CLASSIFICATION) applies when the caller
+    # passes none — set the module attr directly (env is read at import time).
+    _install_fake()
+    prev = summarize.DEFAULT_CLASSIFICATION
+    summarize.DEFAULT_CLASSIFICATION = "CUI"
+    try:
+        summarize._summarize_sync("text", "alice")
+        check(_captured["headers"].get("x-data-classification") == "CUI",
+              f"env-default classification should ride the header: {_captured['headers']}")
+    finally:
+        summarize.DEFAULT_CLASSIFICATION = prev
+
+
 def test_status():
     st = summarize.status()
     check(st["summarize_enabled"] is True and st["summarize_endpoint"] == "http://secrouter.test/v1",

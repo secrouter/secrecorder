@@ -32,6 +32,14 @@ MODEL = os.environ.get("SECRECORDER_SUMMARIZE_MODEL", "auto").strip()
 API_KEY = os.environ.get("SECRECORDER_SUMMARIZE_API_KEY", "").strip()
 # Fallback attribution when the caller is anonymous (auth off): the service's own identity.
 DEFAULT_ACTING_USER = os.environ.get("SECRECORDER_SUMMARIZE_ACTING_USER", "svc-secrecorder").strip()
+# The classification LEVEL asserted on the summarize call (``x-data-classification``) — the header
+# SecRouter's clearance + data-residency egress gate keys on. SecRecorder has no marking model of
+# its own, so this is a DEPLOYMENT setting: set it to the level recordings carry in your enclave
+# (e.g. ``CUI``) so transcript summaries are gated at the right level instead of SecRouter's
+# default. Empty (the default) omits the header — the pre-existing behavior. A caller integrating
+# per-recording markings (e.g. SecChat Meetings) can override per call via ``summarize(...,
+# classification=...)``. The name must match a level in SecRouter's security.classification.levels.
+DEFAULT_CLASSIFICATION = os.environ.get("SECRECORDER_SUMMARIZE_CLASSIFICATION", "").strip()
 PROMPT = os.environ.get(
     "SECRECORDER_SUMMARIZE_PROMPT",
     "You are a precise meeting summarizer. Given a transcript, produce a concise summary: a short "
@@ -50,7 +58,7 @@ class SummarizeError(Exception):
     """A summarization call failed (endpoint unreachable, non-2xx, or a malformed response)."""
 
 
-def _summarize_sync(text: str, acting_user: str | None) -> str:
+def _summarize_sync(text: str, acting_user: str | None, classification: str | None = None) -> str:
     body = text if len(text) <= MAX_CHARS else text[:MAX_CHARS] + "\n\n[transcript truncated]"
     payload = json.dumps({
         "model": MODEL,
@@ -65,6 +73,11 @@ def _summarize_sync(text: str, acting_user: str | None) -> str:
         # policy/budget/audit. Falls back to the service identity when the caller is anonymous.
         "X-Sec-Acting-User": acting_user or DEFAULT_ACTING_USER,
     }
+    effective_classification = (classification or DEFAULT_CLASSIFICATION).strip()
+    if effective_classification:
+        # The transcript's classification level — SecRouter's clearance + egress gate evaluates
+        # the call at this level instead of its configured default (see DEFAULT_CLASSIFICATION).
+        headers["x-data-classification"] = effective_classification
     if API_KEY:
         headers["Authorization"] = f"Bearer {API_KEY}"
     req = urllib.request.Request(f"{ENDPOINT}/chat/completions", data=payload, headers=headers, method="POST")
@@ -82,16 +95,24 @@ def _summarize_sync(text: str, acting_user: str | None) -> str:
     return content.strip()
 
 
-async def summarize(text: str, acting_user: str | None = None) -> str:
-    """Summarize ``text`` via the configured chat endpoint, attributed to ``acting_user``. Runs the
-    blocking HTTP call off the event loop. Raises :class:`SummarizeError` on any failure."""
+async def summarize(text: str, acting_user: str | None = None, classification: str | None = None) -> str:
+    """Summarize ``text`` via the configured chat endpoint, attributed to ``acting_user`` and
+    asserted at ``classification`` (a level name; defaults to the deployment's
+    ``SECRECORDER_SUMMARIZE_CLASSIFICATION``, empty ⇒ header omitted). Runs the blocking HTTP call
+    off the event loop. Raises :class:`SummarizeError` on any failure."""
     if not enabled:
         raise SummarizeError("summarization is not configured")
     if not text or not text.strip():
         raise SummarizeError("nothing to summarize")
-    return await asyncio.to_thread(_summarize_sync, text, acting_user)
+    return await asyncio.to_thread(_summarize_sync, text, acting_user, classification)
 
 
 def status() -> dict:
     """Summarization summary for /health."""
-    return {"summarize_enabled": enabled, **({"summarize_endpoint": ENDPOINT, "summarize_model": MODEL} if enabled else {})}
+    return {
+        "summarize_enabled": enabled,
+        **({
+            "summarize_endpoint": ENDPOINT, "summarize_model": MODEL,
+            **({"summarize_classification": DEFAULT_CLASSIFICATION} if DEFAULT_CLASSIFICATION else {}),
+        } if enabled else {}),
+    }
