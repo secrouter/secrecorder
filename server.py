@@ -59,11 +59,13 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 # pyannote runs on torch; a few ops still lack MPS kernels on Apple — fall back per-op.
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from speakers import SpeakerLibrary, SpeakerError
+import auth
+from summarize import summarize as run_summary, SummarizeError, enabled as summarize_enabled, status as summarize_status
 
 BACKEND = os.environ.get("WHISPER_BACKEND", "auto").strip().lower()
 MODEL = os.environ.get("WHISPER_MODEL", "").strip()  # empty → per-backend default below
@@ -243,6 +245,10 @@ try:
         _UI_HTML = _f.read()
 except OSError:
     pass
+
+# Optional SSO auth (auth.py): mounts /auth/* + an enforcement middleware that guards /v1/* and
+# bounces the UI to SSO login. A no-op for request handling unless SECRECORDER_OIDC_* is configured.
+auth.install(app)
 
 _diarizer = None  # lazy-loaded pyannote pipeline (first diarize request pays the load)
 _diarizer_device = ""
@@ -468,7 +474,8 @@ def health() -> dict:
             "speaker_library_enabled": SPEAKER_LIBRARY_ENABLED,
             "identify_default": SPEAKER_IDENTIFY_DEFAULT,
             "identify_threshold": SPEAKER_THRESHOLD,
-            **({"speaker_count": _library.count()} if _library is not None else {})}
+            **({"speaker_count": _library.count()} if _library is not None else {}),
+            "auth": auth.status(), "summarize": summarize_status()}
 
 
 # --- OpenAI-compatible Models API -------------------------------------------------
@@ -616,10 +623,12 @@ async def _spool_upload(file: UploadFile) -> tuple[str, int]:
 
 
 @app.post("/v1/audio/transcriptions")
-async def transcriptions(file: UploadFile = File(...),
+async def transcriptions(request: Request,
+                         file: UploadFile = File(...),
                          diarize: str | None = Form(None),
                          identify: str | None = Form(None),
-                         prompt: str | None = Form(None)) -> JSONResponse:
+                         prompt: str | None = Form(None),
+                         summarize: str | None = Form(None)) -> JSONResponse:
     """OpenAI-compatible transcription. The ``model`` / ``response_format`` /
     ``timestamp_granularities[]`` form fields the client sends are accepted and ignored — this
     server always uses the loaded model and always returns verbose_json + word[].
@@ -711,6 +720,19 @@ async def transcriptions(file: UploadFile = File(...),
     if requested_identify and not SPEAKER_LIBRARY_ENABLED:
         payload["identification_disabled"] = True  # asked for, but the library is disabled here
 
+    # Optional summarization (summarize.py): a governed LLM call attributed to the authenticated
+    # caller (X-Sec-Acting-User → SecRouter). Off unless configured AND requested; a failure
+    # degrades gracefully to a summary_error rather than losing the transcript.
+    want_summary = summarize is not None and summarize.strip().lower() in ("1", "true", "yes", "on")
+    if want_summary and summarize_enabled and payload.get("text", "").strip():
+        principal = auth.current_principal(request)
+        try:
+            payload["summary"] = await run_summary(payload["text"], principal.sub if principal else None)
+        except SummarizeError as e:
+            payload["summary_error"] = str(e)
+    elif want_summary and not summarize_enabled:
+        payload["summary_disabled"] = True  # asked for, but summarization isn't configured here
+
     dur = payload["duration"]
     rtf = f"{dur / elapsed:.0f}x realtime" if elapsed > 0 else "n/a"
     n_named = sum(1 for sp in payload.get("speakers", []) if sp.get("name"))
@@ -728,3 +750,24 @@ async def transcriptions(file: UploadFile = File(...),
     print(f"[whisper] {os.path.basename(file.filename or 'audio')}: {size / 1e6:.1f}MB upload, "
           f"{len(words)} words{dia_note}, {dur:.0f}s audio in {elapsed:.1f}s ({rtf})")
     return JSONResponse(payload)
+
+
+class SummarizeBody(BaseModel):
+    text: str
+
+
+@app.post("/v1/summarize")
+async def summarize_text(request: Request, body: SummarizeBody) -> dict:
+    """Summarize arbitrary text (e.g. a prior transcript) via the configured governed LLM endpoint —
+    the standalone counterpart to ``summarize=true`` on the transcription route. 503 when
+    summarization isn't configured; 502 when the LLM call fails."""
+    if not summarize_enabled:
+        raise HTTPException(status_code=503, detail="summarization is not configured")
+    if not body.text.strip():
+        raise HTTPException(status_code=400, detail="empty text")
+    principal = auth.current_principal(request)
+    try:
+        summary = await run_summary(body.text, principal.sub if principal else None)
+    except SummarizeError as e:
+        raise HTTPException(status_code=502, detail=f"summarization failed: {e}") from e
+    return {"summary": summary}

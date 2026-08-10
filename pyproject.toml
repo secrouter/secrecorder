@@ -12,6 +12,9 @@ dependencies = [
     "uvicorn[standard]",
     "python-multipart",
     "python-dotenv",
+    # Optional SSO auth (auth.py): OIDC JWKS bearer + browser-login BFF against SecSSO. `crypto`
+    # pulls `cryptography` for RS256 verification. Inert unless SECRECORDER_OIDC_* is configured.
+    "pyjwt[crypto]",
     "pyannote.audio>=4",
     # ASR backend is platform-specific; server.py auto-selects at runtime:
     #   Apple Silicon → MLX/Metal ; Linux → faster-whisper/CTranslate2 (CUDA or CPU).

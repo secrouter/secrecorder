@@ -26,6 +26,11 @@ across recordings.
   recording's diarized speakers are matched back to them by cosine similarity — each `speakers[]`
   entry gains `name` + `match_score`. The library is a local SQLite file; manage it via
   `/v1/speakers` or the web UI. No extra model, nothing leaves the box.
+- **Optional SSO auth** (off by default): validate SecSSO (OIDC) bearer JWTs on the API, and log the
+  built-in UI in through SecSSO — Authorization Code + PKCE, httpOnly session cookie. See below.
+- **Optional summarization** (off by default): attach a `summary` to a transcript via any
+  OpenAI-compatible chat endpoint — governed through SecRouter by default (per-user attribution +
+  audit). Use `summarize=true` on the transcription call, or `POST /v1/summarize` for any text.
 - **Built for long recordings:** the blocking transcription runs off the event loop (so `/health`
   stays responsive), GPU work is serialized, uploads stream to disk, and the model is prewarmed at
   startup so a restart has no cold-start hit.
@@ -97,6 +102,16 @@ client.audio.transcriptions.create(model="whisper-1", file=open("audio.wav", "rb
 | `SPEAKER_DB` | next to `server.py` | SQLite path for enrolled voiceprints (`speakers.db`) |
 | `SPEAKER_IDENTIFY` | `0` | default `identify` on when a request omits it |
 | `SPEAKER_IDENTIFY_THRESHOLD` | `0.5` | cosine match cut-off (same voice ≈0.9+, different ≈0.3) |
+| `SECRECORDER_OIDC_ISSUER` | — | SecSSO issuer — set (with `_CLIENT_ID`) to require SSO on `/v1/*` |
+| `SECRECORDER_OIDC_CLIENT_ID` | — | this service's OIDC client id / token audience |
+| `SECRECORDER_OIDC_CLIENT_SECRET` | — | confidential-client secret — enables the browser-login BFF |
+| `SECRECORDER_PUBLIC_URL` | — | external URL (builds the OIDC redirect + the cookie `Secure` flag) |
+| `SECRECORDER_SESSION_SECRET` | — | session-cookie signing key (browser login) |
+| `SECRECORDER_SUMMARIZE_ENABLED` | `0` | enable transcript summarization (needs an endpoint) |
+| `SECRECORDER_SUMMARIZE_ENDPOINT` | — | OpenAI-compatible base URL (e.g. SecRouter `…/v1`) |
+| `SECRECORDER_SUMMARIZE_MODEL` | `auto` | model id for the summary call |
+| `SECRECORDER_SUMMARIZE_API_KEY` | — | optional bearer for the summarization endpoint |
+| `SECRECORDER_SUMMARIZE_PROMPT` | (built-in) | system prompt for the summary |
 
 `WHISPER_*` are read from the process environment (e.g. `run.sh`); `HF_TOKEN` is read from `.env`
 (written by `install.sh`, chmod 600). Per-request, `diarize=true|false` overrides `WHISPER_DIARIZE`.
@@ -153,6 +168,40 @@ voiceprint) · `POST /v1/speakers/{id}/samples` (add a sample) · `DELETE /v1/sp
 
 Tune `SPEAKER_IDENTIFY_THRESHOLD` (default `0.5`): raise it to cut false matches, lower it to tolerate
 more cross-condition variation. `SPEAKER_LIBRARY=0` disables the feature entirely on a locked-down host.
+
+## SSO authentication (optional)
+
+Off by default — with no `SECRECORDER_OIDC_*` set, the API and UI are open, exactly as before. Set
+`SECRECORDER_OIDC_ISSUER` + `SECRECORDER_OIDC_CLIENT_ID` to require a valid **SecSSO** (OIDC) token on
+every `/v1/*` route: a programmatic client sends `Authorization: Bearer <token>` and it is verified
+against the issuer's JWKS (RS256 pinned, plus issuer, audience, expiry). `/health` stays open.
+
+For the **built-in web UI**, additionally set `SECRECORDER_OIDC_CLIENT_SECRET` +
+`SECRECORDER_PUBLIC_URL` + `SECRECORDER_SESSION_SECRET` to enable a server-side login BFF: an
+unauthenticated browser at `/` is bounced through SecSSO (Authorization Code + PKCE), and the only
+credential the browser ever holds is an httpOnly `secrecorder_session` cookie — it never sees an OIDC
+token. Routes: `GET /auth/login` · `GET /auth/callback` · `POST /auth/logout` · `GET /auth/status`.
+
+In the SecRouter suite, SecDeploy wires this automatically (a `secrecorder` OIDC client in SecSSO +
+the env above). Override the audience with `SECRECORDER_OIDC_AUDIENCE`; skip OIDC discovery with
+`SECRECORDER_OIDC_{JWKS,AUTHORIZE,TOKEN}_URL`.
+
+## Summarization (optional)
+
+Off by default. Set `SECRECORDER_SUMMARIZE_ENABLED=1` + `SECRECORDER_SUMMARIZE_ENDPOINT` (an
+OpenAI-compatible base URL) to attach a `summary` to transcripts via a chat/completions call. Two
+surfaces:
+
+- **inline** — pass `summarize=true` on `POST /v1/audio/transcriptions`; the response gains a
+  `summary` (or a `summary_error` if the LLM call fails — the transcript is never lost).
+- **standalone** — `POST /v1/summarize` with `{"text": "…"}` summarizes any text (e.g. a prior
+  transcript).
+
+**Governed by default:** point the endpoint at **SecRouter** (`…/v1`) and each call carries
+`X-Sec-Acting-User` (the authenticated caller), so the summarization LLM call is attributed, budgeted,
+egress-controlled, and audited per user — the same governed path SecChat's assistant uses. It can
+instead hit SecLLM directly or any endpoint. Tune with
+`SECRECORDER_SUMMARIZE_{MODEL,API_KEY,PROMPT,MAX_CHARS,TIMEOUT}`.
 
 ## License
 
