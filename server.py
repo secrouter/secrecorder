@@ -75,6 +75,13 @@ COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "").strip()
 MAX_CONCURRENCY = max(1, int(os.environ.get("WHISPER_MAX_CONCURRENCY", "1")))
 # Optional upload cap in MiB; 0 = unlimited. Guards the disk against a runaway upload.
 MAX_UPLOAD_MB = int(os.environ.get("WHISPER_MAX_UPLOAD_MB", "0"))
+
+# Dead-air guard. Whisper HALLUCINATES on silence — an empty/near-silent recording (e.g. a voice
+# memo where the mic never captured anything) comes back as fabricated junk ("Thank you.", repeated
+# phrases, ...). Before ASR we measure the clip's PEAK volume (ffmpeg volumedetect); if even the
+# loudest moment is below this many dBFS, we return an empty transcript instead of running whisper.
+# Real speech peaks well above -45 dB; a silent clip reads <= -60 dB (or -inf). Set >= 0 to disable.
+SILENCE_MAX_DB = float(os.environ.get("WHISPER_SILENCE_MAX_DB", "-45"))
 # Diarization runs on a SEPARATE semaphore (torch/MPS) from ASR (MLX), so episode N's diarization
 # doesn't block episode N+1's transcription — the two frameworks pipeline on the GPU.
 DIA_CONCURRENCY = max(1, int(os.environ.get("WHISPER_DIA_CONCURRENCY", "1")))
@@ -356,6 +363,28 @@ def _speaker_embeddings(out) -> dict[str, list[float]]:
 _FFMPEG = shutil.which("ffmpeg")
 
 
+def _peak_volume_db(path: str) -> float | None:
+    """The clip's PEAK volume in dBFS via ffmpeg's ``volumedetect`` (~0 = full scale; silence reads
+    very low). Returns None if ffmpeg is absent or the probe fails — the caller then can't tell and
+    transcribes normally (fail-open, never drop real audio)."""
+    if not _FFMPEG:
+        return None
+    try:
+        proc = subprocess.run(
+            [_FFMPEG, "-nostdin", "-hide_banner", "-i", path, "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in (proc.stderr or "").splitlines():
+        if "max_volume:" in line:  # e.g. "[Parsed_volumedetect_0 @ ..] max_volume: -12.3 dB"
+            try:
+                return float(line.split("max_volume:")[1].strip().split()[0])
+            except (ValueError, IndexError):
+                return None
+    return None
+
+
 def _to_wav16k(path: str):
     """Transcode any input to 16 kHz mono PCM WAV via ffmpeg. pyannote decodes a file in chunks and
     its strict crop raises on compressed input — AAC/m4a encoder priming makes a chunk come back a
@@ -634,6 +663,25 @@ async def transcriptions(file: UploadFile = File(...),
     if size == 0:
         os.unlink(path)
         raise HTTPException(status_code=400, detail="empty file")
+
+    # Dead-air guard (SILENCE_MAX_DB): a silent clip is returned as an EMPTY transcript rather than
+    # letting whisper hallucinate junk on it. Fail-open — a probe that can't measure the level
+    # (ffmpeg missing/errored → None) transcribes normally.
+    if SILENCE_MAX_DB < 0:
+        peak = await asyncio.to_thread(_peak_volume_db, path)
+        if peak is not None and peak < SILENCE_MAX_DB:
+            os.unlink(path)
+            return JSONResponse({
+                "task": "transcribe",
+                "language": "en",
+                "duration": 0.0,
+                "text": "",
+                "words": [],
+                "segments": [],
+                "speakers": [],
+                "silence": True,
+                "max_volume_db": peak,
+            })
 
     _inflight += 1
     t0 = time.monotonic()
