@@ -39,6 +39,8 @@ import jwt
 # part), so this module's crypto/OIDC helpers import with just PyJWT + the stdlib — the unit tests
 # exercise them without pulling the web (or ML) stack, matching this repo's test convention.
 
+import audit  # stdlib-only (see audit.py) — safe to import unconditionally, no extra weight here.
+
 # ── Config (env) ──────────────────────────────────────────────────────────────────────────────
 ISSUER = os.environ.get("SECRECORDER_OIDC_ISSUER", "").strip().rstrip("/")
 CLIENT_ID = os.environ.get("SECRECORDER_OIDC_CLIENT_ID", "").strip()
@@ -345,6 +347,10 @@ def install(app) -> None:
             request.state.principal = principal
             path = request.url.path
             if principal is None and _is_protected(path):
+                # Lifecycle/accountability event (Spec B.7) — never fail-closed on this: a logging
+                # failure degrades to stderr (AuditLogger._write) and the 401 is returned either way.
+                audit.record("auth.failure", source_ip=request.client.host if request.client else None,
+                             target={"path": path}, outcome="deny")
                 return JSONResponse({"error": "unauthorized"}, status_code=401)
             # A browser hitting the UI with no session → send it through SSO (only when the browser
             # login is actually available; a bearer-only deployment 401s the API and has no UI login).

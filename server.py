@@ -52,6 +52,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 
 from dotenv import load_dotenv
 
@@ -64,6 +65,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from speakers import SpeakerLibrary, SpeakerError
+import audit
 import auth
 from summarize import summarize as run_summary, SummarizeError, enabled as summarize_enabled, status as summarize_status
 
@@ -326,6 +328,17 @@ def _require_library() -> SpeakerLibrary:
     return _get_library()
 
 
+def _principal_sub(request: Request) -> str:
+    """The authenticated caller's `sub` for audit attribution, or "anonymous" — auth is off by
+    default (open service), and even when it's on some routes may allow an anonymous caller."""
+    p = auth.current_principal(request)
+    return p.sub if p else "anonymous"
+
+
+def _client_ip(request: Request) -> str | None:
+    return request.client.host if request.client else None
+
+
 def _json_safe(obj, path: str = "", found: list | None = None):
     """Replace non-finite floats (NaN / ±inf) with None, recursively.
 
@@ -504,7 +517,7 @@ def health() -> dict:
             "identify_default": SPEAKER_IDENTIFY_DEFAULT,
             "identify_threshold": SPEAKER_THRESHOLD,
             **({"speaker_count": _library.count()} if _library is not None else {}),
-            "auth": auth.status(), "summarize": summarize_status()}
+            "auth": auth.status(), "summarize": summarize_status(), "audit": audit.status()}
 
 
 # --- OpenAI-compatible Models API -------------------------------------------------
@@ -559,13 +572,20 @@ def speakers_list() -> dict:
 
 
 @app.post("/v1/speakers", status_code=201)
-def speakers_enroll(body: EnrollBody) -> dict:
+def speakers_enroll(request: Request, body: EnrollBody) -> dict:
     """Enroll a speaker from a voiceprint vector — e.g. a ``speakers[].embedding`` returned by a
     prior transcription. To enroll straight from an audio sample use ``/v1/speakers/from-audio``."""
     try:
-        return _require_library().enroll(body.name, body.embedding, source=body.source, meta=body.meta)
+        spk = _require_library().enroll(body.name, body.embedding, source=body.source, meta=body.meta)
     except SpeakerError as e:
+        audit.record("speaker.enroll", principal=_principal_sub(request), source_ip=_client_ip(request),
+                     outcome="error", detail={"source": body.source or "vector", "error": str(e)})
         raise HTTPException(status_code=400, detail=str(e)) from e
+    # target = the speaker id (Spec B.1); detail is metadata only — never the enrolled name/voice
+    # (voiceprints and the identity they carry are exactly what B.3 says never lands in the log).
+    audit.record("speaker.enroll", principal=_principal_sub(request), source_ip=_client_ip(request),
+                 target={"speakerId": spk["id"]}, detail={"source": body.source or "vector"})
+    return spk
 
 
 @app.get("/v1/speakers/{speaker_id}")
@@ -578,25 +598,33 @@ def speakers_get(speaker_id: str, centroid: bool = False) -> dict:
 
 
 @app.post("/v1/speakers/{speaker_id}/samples", status_code=201)
-def speakers_add_sample(speaker_id: str, body: SampleBody) -> dict:
+def speakers_add_sample(request: Request, speaker_id: str, body: SampleBody) -> dict:
     """Add another voiceprint to an existing speaker — more samples sharpen recognition."""
     try:
-        return _require_library().add_sample(speaker_id, body.embedding, source=body.source)
+        spk = _require_library().add_sample(speaker_id, body.embedding, source=body.source)
     except SpeakerError as e:
         code = 404 if "unknown speaker" in str(e) else 400
+        audit.record("speaker.update", principal=_principal_sub(request), source_ip=_client_ip(request),
+                     target={"speakerId": speaker_id}, outcome="error", detail={"error": str(e)})
         raise HTTPException(status_code=code, detail=str(e)) from e
+    audit.record("speaker.update", principal=_principal_sub(request), source_ip=_client_ip(request),
+                 target={"speakerId": speaker_id}, detail={"source": body.source or "vector",
+                                                            "samples": spk.get("samples")})
+    return spk
 
 
 @app.delete("/v1/speakers/{speaker_id}")
-def speakers_delete(speaker_id: str) -> dict:
+def speakers_delete(request: Request, speaker_id: str) -> dict:
     """Remove a speaker and all its voiceprints."""
     if not _require_library().delete(speaker_id):
         raise HTTPException(status_code=404, detail=f"unknown speaker: {speaker_id}")
+    audit.record("speaker.delete", principal=_principal_sub(request), source_ip=_client_ip(request),
+                 target={"speakerId": speaker_id})
     return {"deleted": speaker_id}
 
 
 @app.post("/v1/speakers/from-audio", status_code=201)
-async def speakers_enroll_audio(file: UploadFile = File(...), name: str = Form(...)) -> dict:
+async def speakers_enroll_audio(request: Request, file: UploadFile = File(...), name: str = Form(...)) -> dict:
     """Enroll a speaker from an audio sample: diarize it, take the dominant speaker's voiceprint,
     and store it under ``name``. Use a clean, single-speaker sample. Requires diarization."""
     lib = _require_library()
@@ -626,7 +654,11 @@ async def speakers_enroll_audio(file: UploadFile = File(...), name: str = Form(.
     try:
         spk = lib.enroll(name, emb[dominant], source=f"audio:{os.path.basename(file.filename or 'sample')}")
     except SpeakerError as e:
+        audit.record("speaker.enroll", principal=_principal_sub(request), source_ip=_client_ip(request),
+                     outcome="error", detail={"source": "audio", "error": str(e)})
         raise HTTPException(status_code=400, detail=str(e)) from e
+    audit.record("speaker.enroll", principal=_principal_sub(request), source_ip=_client_ip(request),
+                 target={"speakerId": spk["id"]}, detail={"source": "audio", "speakersInSample": len(talk)})
     return {**spk, "speakers_in_sample": len(talk)}
 
 
@@ -663,6 +695,13 @@ async def transcriptions(request: Request,
     server always uses the loaded model and always returns verbose_json + word[].
     ``diarize=true`` adds ``speaker`` to every word/segment + a ``speakers`` summary."""
     global _inflight
+    # No recording is persisted anywhere in this server (each upload is transcribed and discarded —
+    # see _spool_upload/finally below), so there is no durable "recording id" to audit against. A
+    # fresh per-request id is the closest equivalent (Spec B.1 "target: recording id"), letting an
+    # operator correlate this one audit entry with server logs / a client-side request id.
+    audit_rid = uuid.uuid4().hex[:12]
+    audit_principal = _principal_sub(request)
+    audit_ip = _client_ip(request)
     requested_diarize = (DIARIZE_DEFAULT if diarize is None
                          else diarize.strip().lower() in ("1", "true", "yes", "on"))
     requested_identify = (SPEAKER_IDENTIFY_DEFAULT if identify is None
@@ -684,6 +723,11 @@ async def transcriptions(request: Request,
         peak = await asyncio.to_thread(_peak_volume_db, path)
         if peak is not None and peak < SILENCE_MAX_DB:
             os.unlink(path)
+            audit.record("transcription.run", principal=audit_principal, source_ip=audit_ip,
+                         target={"requestId": audit_rid},
+                         detail={"sizeBytes": size, "silenceGated": True, "durationSec": 0.0,
+                                 "diarize": requested_diarize, "identify": requested_identify,
+                                 "maxVolumeDb": peak})
             return JSONResponse({
                 "task": "transcribe",
                 "language": "en",
@@ -712,6 +756,10 @@ async def transcriptions(request: Request,
     except HTTPException:
         raise
     except Exception as e:  # noqa: BLE001 — surface the reason instead of a bare 500
+        audit.record("transcription.run", principal=audit_principal, source_ip=audit_ip,
+                     target={"requestId": audit_rid}, outcome="error",
+                     detail={"sizeBytes": size, "diarize": requested_diarize,
+                             "identify": requested_identify, "error": f"{type(e).__name__}: {e}"})
         raise HTTPException(status_code=500, detail=f"transcription failed: {e}") from e
     finally:
         _inflight -= 1
@@ -774,12 +822,29 @@ async def transcriptions(request: Request,
     want_summary = summarize is not None and summarize.strip().lower() in ("1", "true", "yes", "on")
     if want_summary and summarize_enabled and payload.get("text", "").strip():
         principal = auth.current_principal(request)
+        text = payload["text"]
         try:
-            payload["summary"] = await run_summary(payload["text"], principal.sub if principal else None)
+            payload["summary"] = await run_summary(text, principal.sub if principal else None)
+            # The LLM call itself is governed/audited at SecRouter (attribution, budget, egress) —
+            # this is just the request-level accountability event for SecRecorder's own audit trail.
+            audit.record("summarize.request", principal=audit_principal, source_ip=audit_ip,
+                         target={"requestId": audit_rid},
+                         detail={"governedBy": "secrouter", "transcriptChars": len(text)})
         except SummarizeError as e:
             payload["summary_error"] = str(e)
+            audit.record("summarize.request", principal=audit_principal, source_ip=audit_ip,
+                         target={"requestId": audit_rid}, outcome="error",
+                         detail={"governedBy": "secrouter", "transcriptChars": len(text), "error": str(e)})
     elif want_summary and not summarize_enabled:
         payload["summary_disabled"] = True  # asked for, but summarization isn't configured here
+
+    audit.record("transcription.run", principal=audit_principal, source_ip=audit_ip,
+                 target={"requestId": audit_rid},
+                 detail={"sizeBytes": size, "durationSec": round(payload["duration"], 2),
+                         "elapsedSec": round(elapsed, 2), "diarize": want_diarize,
+                         "identify": want_identify, "silenceGated": False,
+                         "speakerCount": n_speakers, "backend": BACKEND_NAME, "model": MODEL_ID,
+                         "summarizeRequested": want_summary})
 
     dur = payload["duration"]
     rtf = f"{dur / elapsed:.0f}x realtime" if elapsed > 0 else "n/a"
@@ -817,5 +882,91 @@ async def summarize_text(request: Request, body: SummarizeBody) -> dict:
     try:
         summary = await run_summary(body.text, principal.sub if principal else None)
     except SummarizeError as e:
+        audit.record("summarize.request", principal=_principal_sub(request), source_ip=_client_ip(request),
+                     outcome="error",
+                     detail={"governedBy": "secrouter", "transcriptChars": len(body.text), "error": str(e)})
         raise HTTPException(status_code=502, detail=f"summarization failed: {e}") from e
+    audit.record("summarize.request", principal=_principal_sub(request), source_ip=_client_ip(request),
+                 detail={"governedBy": "secrouter", "transcriptChars": len(body.text)})
     return {"summary": summary}
+
+
+# --- Audit + CMMC evidence (Spec B.6/B.7) -------------------------------------------------------
+# Both routes live under /v1/, so they get the SAME gate every other API route gets: when auth is
+# on, a valid principal is required (401 otherwise) — auth.py's middleware already enforces this for
+# anything under /v1/. There is no admin/group concept anywhere else in this service (Principal
+# carries `groups` from the OIDC token, but nothing in this codebase checks them), so "any
+# authenticated principal" IS the strictest gate available here; inventing a new admin-group check
+# for just these two routes would be a new, ungated trust boundary of exactly the kind Spec B.4
+# warns against. When auth is off (the default, open-service posture), these stay open like the
+# rest of /v1/ — consistent, not a special case.
+
+
+@app.get("/v1/audit/verify")
+def audit_verify() -> dict:
+    """Verify the audit hash chain (AU-3.3.8 tamper-evidence)."""
+    ok, checked, broken = audit.verify_chain(audit.AUDIT_PATH)
+    return {"ok": ok, "checked": checked, **({"brokenAtSeq": broken} if broken is not None else {})}
+
+
+@app.get("/v1/evidence")
+def evidence() -> dict:
+    """One-shot CMMC evidence bundle (Spec B.6): sanitized config posture, the audit chain's
+    verification result, the last 200 audit records, and a small control self-assessment. Never
+    includes a secret/token — only model names, thresholds, paths, and feature flags."""
+    ok, checked, broken = audit.verify_chain(audit.AUDIT_PATH)
+    return {
+        "product": "secrecorder",
+        "version": app.version,
+        "generatedAt": audit.now_iso(),
+        "generatedBy": "secrecorder:/v1/evidence",
+        "config": {
+            "backend": BACKEND_NAME,
+            "model": MODEL_ID,
+            "diarizeEnabled": DIARIZE_ENABLED,
+            "diarizeDefault": DIARIZE_DEFAULT,
+            "diarizeModel": DIARIZE_MODEL,
+            "silenceMaxDb": SILENCE_MAX_DB,
+            "speakerLibraryEnabled": SPEAKER_LIBRARY_ENABLED,
+            "speakerIdentifyDefault": SPEAKER_IDENTIFY_DEFAULT,
+            "speakerIdentifyThreshold": SPEAKER_THRESHOLD,
+            "authEnabled": auth.auth_enabled,
+            "ssoLoginReady": auth.sso_ready,
+            "bearerReady": auth.bearer_ready,
+            "summarizeEnabled": summarize_enabled,
+            "summarizeGovernedBy": "secrouter (or whatever endpoint this deployment configured)",
+            "auditEnabled": audit.AUDIT_ENABLED,
+            "auditPath": audit.AUDIT_PATH,
+        },
+        "auditChain": {"ok": ok, "checked": checked, **({"brokenAtSeq": broken} if broken is not None else {})},
+        "auditRecent": audit.tail_records(audit.AUDIT_PATH, 200),
+        "controls": [
+            {"id": "AU-3.3.1", "family": "AU",
+             "requirement": "Create and retain system audit records for lifecycle/admin events.",
+             "status": "implemented",
+             "evidence": "audit.jsonl events: transcription.run, speaker.enroll/update/delete, "
+                         "summarize.request, auth.failure — see auditRecent[] above."},
+            {"id": "AU-3.3.8", "family": "AU",
+             "requirement": "Protect audit information and audit logging tools from unauthorized "
+                            "access, modification, and deletion.",
+             "status": "implemented",
+             "evidence": "SHA-256 hash chain (audit.verify_chain); GET /v1/audit/verify; "
+                         "0700/0600 at-rest permissions on the log directory/file."},
+            {"id": "IA-3.5.2", "family": "IA",
+             "requirement": "Authenticate the identity of users, processes, or devices before "
+                            "allowing access.",
+             "status": "implemented" if auth.auth_enabled else "not enforced on this deployment",
+             "evidence": "auth.py OIDC bearer (JWKS/RS256) + browser-login BFF against SecSSO; "
+                         "principal.sub carried into every audit record's `principal` field. "
+                         "SecRecorder ships auth OFF BY DEFAULT (open service) — the deployer must "
+                         "set SECRECORDER_OIDC_ISSUER/_AUDIENCE (or _CLIENT_ID+secret+session) in "
+                         "any deployment handling CUI; see docs/control-validation.md."},
+        ],
+        "notes": [
+            {"topic": "SI (silence-gate)",
+             "note": "WHISPER_SILENCE_MAX_DB rejects degenerate/near-silent audio before ASR "
+                     "(Whisper hallucinates fabricated text on silence); gated runs are flagged "
+                     "detail.silenceGated=true in the transcription.run audit event. Informational "
+                     "— not asserted against a specific NIST SP 800-171 control id."},
+        ],
+    }

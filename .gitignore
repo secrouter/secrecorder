@@ -15,6 +15,10 @@ __pycache__/
 *.db-wal
 *.db-shm
 
+# tamper-evident audit trail — per-deployment runtime data, never commit (back up/forward per your
+# retention policy instead; see docs/control-validation.md)
+/data/
+
 # test audio + benchmark data (large / machine-specific) — but keep the .md result docs
 *.wav
 *.aiff
