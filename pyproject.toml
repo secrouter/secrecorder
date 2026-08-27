@@ -12,9 +12,21 @@ dependencies = [
     "uvicorn[standard]",
     "python-multipart",
     "python-dotenv",
+    # Optional SSO auth (auth.py): OIDC JWKS bearer + browser-login BFF against SecSSO. `crypto`
+    # pulls `cryptography` for RS256 verification. Inert unless SECRECORDER_OIDC_* is configured.
+    "pyjwt[crypto]",
     "pyannote.audio>=4",
     # ASR backend is platform-specific; server.py auto-selects at runtime:
     #   Apple Silicon → MLX/Metal ; Linux → faster-whisper/CTranslate2 (CUDA or CPU).
     "mlx-whisper; platform_system == 'Darwin'",
     "faster-whisper; platform_system == 'Linux'",
+]
+
+[project.optional-dependencies]
+# GPU runtime libraries for the faster-whisper (CTranslate2) CUDA backend — cuBLAS + cuDNN 9, which
+# CTranslate2 needs at runtime but does not bundle. Needed only on a CUDA box that lacks system CUDA
+# libraries. Install with:  ./install.sh --with-cuda   (or:  uv sync --extra cuda)
+cuda = [
+    "nvidia-cublas-cu12; platform_system == 'Linux'",
+    "nvidia-cudnn-cu12>=9; platform_system == 'Linux'",
 ]

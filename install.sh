@@ -5,6 +5,7 @@
 #
 #   ./install.sh [SECRETS_FILE]   set up the venv; if given, write SECRETS_FILE -> .env (chmod 600)
 #   ./install.sh --with-ffmpeg    also install the ffmpeg system binary if it is missing
+#   ./install.sh --with-cuda      also install CUDA libs (cuBLAS/cuDNN) for the faster-whisper GPU backend
 #   ./install.sh --service        print a ready-to-use service unit for this platform, then exit
 #
 # Flags combine with SECRETS_FILE, e.g.  ./install.sh --with-ffmpeg secrets.env
@@ -15,11 +16,12 @@ cd "$(dirname "$0")"
 HERE="$(pwd)"
 
 # ---- args -------------------------------------------------------------------------------------
-SERVICE=0; WITH_FFMPEG=0; SECRETS=""
+SERVICE=0; WITH_FFMPEG=0; WITH_CUDA=0; SECRETS=""
 for arg in "$@"; do
   case "$arg" in
     --service)                      SERVICE=1 ;;
     --with-ffmpeg|--install-ffmpeg) WITH_FFMPEG=1 ;;
+    --with-cuda|--cuda)             WITH_CUDA=1 ;;
     --*) echo "error: unknown option: $arg" >&2; exit 1 ;;
     *)   SECRETS="$arg" ;;
   esac
@@ -120,7 +122,16 @@ fi
 
 # ---- deps -------------------------------------------------------------------------------------
 echo "==> installing dependencies with uv (backend auto-selected for this platform)…"
-"$UV" sync
+if [ "$WITH_CUDA" = "1" ]; then
+  "$UV" sync --extra cuda        # + cuBLAS/cuDNN for the faster-whisper (CTranslate2) CUDA backend
+else
+  "$UV" sync
+  # GPU present but CUDA libs not requested? CTranslate2 needs cuBLAS/cuDNN — nudge, don't force.
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    echo "==> NOTE: NVIDIA GPU detected. The faster-whisper CUDA backend needs cuBLAS/cuDNN —" >&2
+    echo "          re-run with --with-cuda to install them (or: uv sync --extra cuda)." >&2
+  fi
+fi
 
 # ---- ffmpeg (system binary, not a Python package) ---------------------------------------------
 # Audio decode for the MLX backend + the diarizer's WAV normalisation (all backends). Must be on PATH.

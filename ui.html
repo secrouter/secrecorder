@@ -101,6 +101,7 @@
     <h1><span class="sec">SEC</span>RECORDER <span class="pill">aka SpeakerBox</span></h1>
     <div class="status">
       <span id="health" class="pill">checking…</span>
+      <span id="authStatus" class="pill hidden"></span>
       <button class="btn ghost theme-toggle" id="themeBtn" title="Toggle theme">◐</button>
     </div>
   </header>
@@ -128,6 +129,8 @@
           &nbsp;
           <label class="f" id="idLabel"><input type="checkbox" id="identify" /> Recognize</label>
           &nbsp;
+          <label class="f hidden" id="sumLabel"><input type="checkbox" id="summarize" /> Summarize</label>
+          &nbsp;
           <button class="btn big" id="goBtn" disabled>Transcribe</button>
         </span>
       </div>
@@ -146,6 +149,10 @@
       <div id="speakerPanel" class="hidden" style="margin-top:16px">
         <div class="divider">speakers in this recording</div>
         <div id="speakerList"></div>
+      </div>
+      <div id="summaryPanel" class="hidden" style="margin-top:16px">
+        <div class="divider">summary</div>
+        <div id="summaryBody" class="plain"></div>
       </div>
     </div>
 
@@ -187,9 +194,37 @@ async function health() {
       $("#diarize").checked = true;
     }
     setupLibrary(h);
+    setupSummarize(h);
   } catch (e) {
     const el = $("#health"); el.className = "pill bad"; el.textContent = "unreachable";
   }
+}
+
+// ── summarization toggle (shown only when the server has it configured) ──
+function setupSummarize(h) {
+  const on = h.summarize && h.summarize.summarize_enabled === true;
+  const lbl = $("#sumLabel");
+  if (on) { lbl.classList.remove("hidden"); lbl.title = "Summarize the transcript with the governed LLM (" + (h.summarize.summarize_model || "") + ")."; }
+  else { lbl.classList.add("hidden"); $("#summarize").checked = false; }
+}
+
+// ── auth status (the session cookie is httpOnly, so ask the server who's signed in) ──
+async function refreshAuth() {
+  try {
+    const s = await (await fetch("/auth/status")).json();
+    const el = $("#authStatus");
+    if (!s.auth_enabled) { el.classList.add("hidden"); return; }
+    el.classList.remove("hidden");
+    if (s.user) {
+      el.className = "pill ok";
+      el.innerHTML = "signed in: " + escapeHtml(s.user.name) + ' · <a href="#" id="signOut">sign out</a>';
+      $("#signOut").onclick = async (e) => { e.preventDefault(); await fetch("/auth/logout", { method: "POST" }); location.reload(); };
+    } else if (s.sso) {
+      el.className = "pill"; el.innerHTML = '<a href="/auth/login?next=/">sign in</a>';
+    } else {
+      el.className = "pill"; el.textContent = "API requires a token";
+    }
+  } catch (e) { $("#authStatus").classList.add("hidden"); }
 }
 
 // ── speaker library (enroll named voiceprints; recognize them across recordings) ──
@@ -377,12 +412,14 @@ async function runTranscribe() {
   status.innerHTML = '<span class="spinner"></span> transcribing…';
   $("#transcript").innerHTML = ""; $("#meta").innerHTML = "";
   $("#speakerPanel").classList.add("hidden");
+  $("#summaryPanel").classList.add("hidden");
   $("#goBtn").disabled = true;
   const fd = new FormData();
   fd.append("file", state.blob, state.name);
   const idOn = $("#identify").checked;
   fd.append("diarize", ($("#diarize").checked || idOn) ? "true" : "false");
   fd.append("identify", idOn ? "true" : "false");
+  if ($("#summarize").checked) fd.append("summarize", "true");
   const t0 = performance.now();
   try {
     const r = await fetch("/v1/audio/transcriptions", { method: "POST", body: fd });
@@ -593,6 +630,7 @@ function render(data) {
     out.innerHTML = '<div class="plain">' + escapeHtml(data.text || "(no speech detected)") + "</div>";
   }
   renderSpeakerPanel(data);
+  renderSummary(data);
   applyTs();
   // exports
   const txt = plainText(data, diarized), md = markdown(data, diarized);
@@ -652,9 +690,16 @@ function wireDownload(a, text, name, type) {
 function pill(t) { return '<span class="pill">' + escapeHtml(String(t)) + "</span>"; }
 function fmt(s) { s = Math.max(0, Math.round(s || 0)); const m = Math.floor(s / 60); return m + ":" + String(s % 60).padStart(2, "0"); }
 function stamp() { const d = new Date(); const p = (n) => String(n).padStart(2, "0"); return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + "-" + p(d.getHours()) + p(d.getMinutes()); }
+function renderSummary(data) {
+  const panel = $("#summaryPanel"), body = $("#summaryBody");
+  if (data.summary) { panel.classList.remove("hidden"); body.textContent = data.summary; }
+  else if (data.summary_error) { panel.classList.remove("hidden"); body.innerHTML = '<span class="muted">Summary unavailable: ' + escapeHtml(data.summary_error) + "</span>"; }
+  else { panel.classList.add("hidden"); body.textContent = ""; }
+}
 function escapeHtml(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
 
 health();
+refreshAuth();
 </script>
 </body>
 </html>
